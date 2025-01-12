@@ -1,27 +1,8 @@
 import { defineProperty } from 'cosmokit'
-import { Context, Schema, Session } from '@satorijs/core'
-import { Eval } from '@minatojs/core'
+import { Eval } from 'minato'
 import { Channel, User } from './database'
-
-declare global {
-  namespace Schemastery {
-    interface Static {
-      filter(): Schema<Computed<boolean>>
-      computed<X>(inner: X, options?: Computed.Options): Schema<Computed<TypeS<X>>, Computed<TypeT<X>>>
-    }
-  }
-}
-
-Schema.filter = function filter() {
-  return Schema.any().role('filter')
-}
-
-Schema.computed = function computed(inner, options = {}) {
-  return Schema.union([inner, Schema.any().hidden()]).role('computed', options)
-}
-
-export type Computed<T> = T | Eval.Expr<T> | ((session: Session) => T)
-export type Filter = (session: Session) => boolean
+import { Context } from './context'
+import { Session } from './session'
 
 export namespace Computed {
   export interface Options {
@@ -30,7 +11,10 @@ export namespace Computed {
   }
 }
 
-declare module '@satorijs/core' {
+export type Computed<T> = T | Eval.Expr<T> | ((session: Session) => T)
+export type Filter = (session: Session) => boolean
+
+declare module './context' {
   interface Context {
     $filter: FilterService
     filter: Filter
@@ -55,16 +39,11 @@ function property<K extends keyof Session>(ctx: Context, key: K, ...values: Sess
 }
 
 export class FilterService {
-  static readonly methods = [
-    'any', 'never', 'union', 'intersect', 'exclude',
-    'user', 'self', 'guild', 'channel', 'platform', 'private',
-  ]
+  constructor(private ctx: Context) {
+    defineProperty(this, Context.current, ctx)
 
-  constructor(private app: Context) {
-    defineProperty(this, Context.current, app)
-
-    app.filter = () => true
-    app.on('internal/runtime', (runtime) => {
+    ctx.filter = () => true
+    ctx.on('internal/runtime', (runtime) => {
       if (!runtime.uid) return
       runtime.ctx.filter = (session) => {
         return runtime.children.some(p => p.ctx.filter(session))
@@ -72,59 +51,50 @@ export class FilterService {
     })
   }
 
-  protected get caller() {
-    return this[Context.current] as Context
-  }
-
   any() {
-    return this.caller.extend({ filter: () => true })
+    return this.ctx.extend({ filter: () => true })
   }
 
   never() {
-    return this.caller.extend({ filter: () => false })
+    return this.ctx.extend({ filter: () => false })
   }
 
   union(arg: Filter | Context) {
-    const caller = this.caller
     const filter = typeof arg === 'function' ? arg : arg.filter
-    return this.caller.extend({ filter: s => caller.filter(s) || filter(s) })
+    return this.ctx.extend({ filter: s => this.ctx.filter(s) || filter(s) })
   }
 
   intersect(arg: Filter | Context) {
-    const caller = this.caller
     const filter = typeof arg === 'function' ? arg : arg.filter
-    return this.caller.extend({ filter: s => caller.filter(s) && filter(s) })
+    return this.ctx.extend({ filter: s => this.ctx.filter(s) && filter(s) })
   }
 
   exclude(arg: Filter | Context) {
-    const caller = this.caller
     const filter = typeof arg === 'function' ? arg : arg.filter
-    return this.caller.extend({ filter: s => caller.filter(s) && !filter(s) })
+    return this.ctx.extend({ filter: s => this.ctx.filter(s) && !filter(s) })
   }
 
   user(...values: string[]) {
-    return property(this.caller, 'userId', ...values)
+    return property(this.ctx, 'userId', ...values)
   }
 
   self(...values: string[]) {
-    return property(this.caller, 'selfId', ...values)
+    return property(this.ctx, 'selfId', ...values)
   }
 
   guild(...values: string[]) {
-    return property(this.caller, 'guildId', ...values)
+    return property(this.ctx, 'guildId', ...values)
   }
 
   channel(...values: string[]) {
-    return property(this.caller, 'channelId', ...values)
+    return property(this.ctx, 'channelId', ...values)
   }
 
   platform(...values: string[]) {
-    return property(this.caller, 'platform', ...values)
+    return property(this.ctx, 'platform', ...values)
   }
 
-  private(...values: string[]) {
-    return property(this.caller.exclude(property(this.caller, 'guildId')), 'userId', ...values)
+  private() {
+    return this.ctx.intersect((session) => session.isDirect)
   }
 }
-
-Context.service('$filter', FilterService)

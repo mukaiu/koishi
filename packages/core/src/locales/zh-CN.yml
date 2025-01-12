@@ -15,6 +15,7 @@ internal:
   $: 核心文本
   error-encountered: 发生未知错误。
   low-authority: 权限不足。
+  prompt-argument: 请发送{0}。
   insufficient-arguments: 缺少参数，输入帮助以查看用法。
   redunant-arguments: 存在多余参数，输入帮助以查看用法。
   invalid-argument: 参数 {0} 输入无效，{1}
@@ -28,8 +29,12 @@ internal:
   invalid-date: 请输入合法的时间。
   invalid-user: 请指定正确的用户。
   invalid-channel: 请指定正确的频道。
+  invalid-image: 请上传图片。
+  invalid-audio: 请上传音频。
+  invalid-video: 请上传视频。
+  invalid-file: 请上传文件。
   suggest-hint: 您要找的是不是{0}？
-  suggest-command: 发送句号以使用推测的指令。
+  suggest-command: 回复句号以使用推测的指令。
 
 commands:
   $: 指令系统

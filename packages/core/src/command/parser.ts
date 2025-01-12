@@ -1,9 +1,13 @@
-import { camelCase, Dict, paramCase, Time } from 'cosmokit'
+import { camelCase, Dict, paramCase } from 'cosmokit'
 import { escapeRegExp } from '@koishijs/utils'
-import { Context, h, Session } from '@satorijs/core'
+import { h } from '@satorijs/core'
 import { Command } from './command'
 import { Channel, User } from '../database'
 import { Next } from '../middleware'
+import { Permissions } from '../permission'
+import { Disposable } from 'cordis'
+import { Session } from '../session'
+import { Context } from '../context'
 
 export interface Token {
   rest?: string
@@ -166,6 +170,8 @@ export namespace Argv {
 
   // builtin domains
   export interface Domain {
+    el: h[]
+    elements: h[]
     string: string
     number: number
     boolean: boolean
@@ -176,10 +182,16 @@ export namespace Argv {
     integer: number
     posint: number
     natural: number
+    bigint: bigint
     date: Date
+    img: JSX.IntrinsicElements['img']
+    image: JSX.IntrinsicElements['img']
+    audio: JSX.IntrinsicElements['audio']
+    video: JSX.IntrinsicElements['video']
+    file: JSX.IntrinsicElements['file']
   }
 
-  type DomainType = keyof Domain
+  export type DomainType = keyof Domain
 
   type ParamType<S extends string, F>
     = S extends `${any}:${infer T}` ? T extends DomainType ? Domain[T] : F : F
@@ -201,7 +213,7 @@ export namespace Argv {
 
   export type OptionType<S extends string> = ExtractFirst<Replace<S, '>', ']'>, any>
 
-  export type Type = DomainType | RegExp | readonly string[] | Transform<any>
+  export type Type = DomainType | RegExp | readonly string[] | Transform<any> | DomainConfig<any>
 
   export interface Declaration {
     name?: string
@@ -213,171 +225,18 @@ export namespace Argv {
 
   export type Transform<T> = (source: string, session: Session) => T
 
-  export interface DomainConfig<T> {
+  export interface DomainConfig<T = any> {
     transform?: Transform<T>
     greedy?: boolean
+    numeric?: boolean
   }
 
-  function resolveConfig(type: Type) {
-    return typeof type === 'string' ? builtin[type] || {} : {}
-  }
-
-  // https://github.com/microsoft/TypeScript/issues/17002
-  // it never got fixed so we have to do this
-  const isArray = Array.isArray as (arg: any) => arg is readonly any[]
-
-  function resolveType(type: Type) {
-    if (typeof type === 'function') {
-      return type
-    } else if (type instanceof RegExp) {
-      return (source: string) => {
-        if (type.test(source)) return source
-        throw new Error()
-      }
-    } else if (isArray(type)) {
-      return (source: string) => {
-        if (type.includes(source)) return source
-        throw new Error()
-      }
-    }
-    return builtin[type]?.transform
-  }
-
-  const builtin: Dict<DomainConfig<any>> = {}
-
-  export function createDomain<K extends keyof Domain>(name: K, transform: Transform<Domain[K]>, options?: DomainConfig<Domain[K]>) {
-    builtin[name] = { ...options, transform }
-  }
-
-  createDomain('string', source => source)
-  createDomain('text', source => source, { greedy: true })
-  createDomain('rawtext', source => h('', h.parse(source)).toString(true), { greedy: true })
-  createDomain('boolean', () => true)
-
-  createDomain('number', (source, session) => {
-    const value = +source
-    if (Number.isFinite(value)) return value
-    throw new Error('internal.invalid-number')
-  })
-
-  createDomain('integer', (source, session) => {
-    const value = +source
-    if (value * 0 === 0 && Math.floor(value) === value) return value
-    throw new Error('internal.invalid-integer')
-  })
-
-  createDomain('posint', (source, session) => {
-    const value = +source
-    if (value * 0 === 0 && Math.floor(value) === value && value > 0) return value
-    throw new Error('internal.invalid-posint')
-  })
-
-  createDomain('natural', (source, session) => {
-    const value = +source
-    if (value * 0 === 0 && Math.floor(value) === value && value >= 0) return value
-    throw new Error('internal.invalid-natural')
-  })
-
-  createDomain('date', (source, session) => {
-    const timestamp = Time.parseDate(source)
-    if (+timestamp) return timestamp
-    throw new Error('internal.invalid-date')
-  })
-
-  createDomain('user', (source, session) => {
-    if (source.startsWith('@')) {
-      source = source.slice(1)
-      if (source.includes(':')) return source
-      return `${session.platform}:${source}`
-    }
-    const code = h.from(source)
-    if (code && code.type === 'at') {
-      return `${session.platform}:${code.data.id}`
-    }
-    throw new Error('internal.invalid-user')
-  })
-
-  createDomain('channel', (source, session) => {
-    if (source.startsWith('#')) {
-      source = source.slice(1)
-      if (source.includes(':')) return source
-      return `${session.platform}:${source}`
-    }
-    const code = h.from(source)
-    if (code && code.type === 'sharp') {
-      return `${session.platform}:${code.data.id}`
-    }
-    throw new Error('internal.invalid-channel')
-  })
-
-  const BRACKET_REGEXP = /<[^>]+>|\[[^\]]+\]/g
-
-  interface DeclarationList extends Array<Declaration> {
-    stripped: string
-  }
-
-  function parseDecl(source: string) {
-    let cap: RegExpExecArray
-    const result = [] as DeclarationList
-    // eslint-disable-next-line no-cond-assign
-    while (cap = BRACKET_REGEXP.exec(source)) {
-      let rawName = cap[0].slice(1, -1)
-      let variadic = false
-      if (rawName.startsWith('...')) {
-        rawName = rawName.slice(3)
-        variadic = true
-      }
-      const [name, rawType] = rawName.split(':')
-      const type = rawType ? rawType.trim() as DomainType : undefined
-      result.push({
-        name,
-        variadic,
-        type,
-        required: cap[0][0] === '<',
-      })
-    }
-    result.stripped = source.replace(/:[\w-]+(?=[>\]])/g, str => {
-      const domain = builtin[str.slice(1)]
-      return domain?.greedy ? '...' : ''
-    }).trimEnd()
-    return result
-  }
-
-  export function parseValue(source: string, quoted: boolean, kind: string, argv: Argv, decl: Declaration = {}) {
-    const { name, type } = decl
-
-    // apply domain callback
-    const transform = resolveType(type)
-    if (transform) {
-      try {
-        return transform(source, argv.session)
-      } catch (err) {
-        if (!argv.session) {
-          argv.error = `internal.invalid-${kind}`
-        } else {
-          const message = argv.session.text(err['message'] || 'internal.check-syntax')
-          argv.error = argv.session.text(`internal.invalid-${kind}`, [name, message])
-        }
-        return
-      }
-    }
-
-    // no explicit parameter
-    if (source === '' && !quoted) return true
-
-    // default behavior
-    if (quoted) return source
-    const n = +source
-    return n * 0 === 0 ? n : source
-  }
-
-  export interface OptionConfig<T extends Type = Type> {
+  export interface OptionConfig<T extends Type = Type> extends Permissions.Config {
     aliases?: string[]
     symbols?: string[]
     value?: any
     fallback?: any
     type?: T
-    authority?: number
     descPath?: string
   }
 
@@ -398,24 +257,38 @@ export namespace Argv {
 
   type OptionDeclarationMap = Dict<OptionDeclaration>
 
-  export class CommandBase {
+  export namespace CommandBase {
+    export interface Config {
+      strictOptions?: boolean
+    }
+  }
+
+  // do not use lookbehind assertion for Safari compatibility
+  const SYNTAX = /(?:-[\w\x80-\uffff-]*|[^,\s\w\x80-\uffff]+)/.source
+  const BRACKET = /((?:\s*\[[^\]]+?\]|\s*<[^>]+?>)*)/.source
+  const OPTION_REGEXP = new RegExp(`^(${SYNTAX}(?:,\\s*${SYNTAX})*(?=\\s|$))?${BRACKET}(.*)$`)
+
+  export class CommandBase<T extends CommandBase.Config = CommandBase.Config> {
     public declaration: string
 
     public _arguments: Declaration[]
     public _options: OptionDeclarationMap = {}
+    public _disposables: Disposable[] = []
 
     private _namedOptions: OptionDeclarationMap = {}
     private _symbolicOptions: OptionDeclarationMap = {}
 
-    constructor(public readonly name: string, declaration: string, public ctx: Context) {
+    constructor(public readonly name: string, declaration: string, public ctx: Context, public config: T) {
       if (!name) throw new Error('expect a command name')
-      const decl = this._arguments = parseDecl(declaration)
-      this.declaration = decl.stripped
+      const declList = this._arguments = ctx.$commander.parseDecl(declaration)
+      this.declaration = declList.stripped
+      for (const decl of declList) {
+        this._disposables.push(this.ctx.i18n.define('', `commands.${this.name}.arguments.${decl.name}`, decl.name))
+      }
     }
 
     _createOption(name: string, def: string, config: OptionConfig) {
-      // do not use lookbehind assertion for Safari compatibility
-      const cap = /^((?:-[\w-]*|[^,\s\w\x80-\uffff]+)(?:,\s*(?:-[\w-]*|[^,\s\w\x80-\uffff]+))*(?=\s|$))?((?:\s*\[[^\]]+?\]|\s*<[^>]+?>)*)(.*)$/.exec(def)
+      const cap = OPTION_REGEXP.exec(def)
       const param = paramCase(name)
       let syntax = cap[1] || '--' + param
       const bracket = cap[2] || ''
@@ -437,10 +310,9 @@ export namespace Argv {
         syntax += ', --' + param
       }
 
-      const declList = parseDecl(bracket.trimStart())
+      const declList = this.ctx.$commander.parseDecl(bracket.trimStart())
       if (declList.stripped) syntax += ' ' + declList.stripped
       const option = this._options[name] ||= {
-        ...Command.defaultOptionConfig,
         ...declList[0],
         ...config,
         name,
@@ -463,7 +335,7 @@ export namespace Argv {
         option.type = fallbackType
       }
 
-      if (desc) this.ctx.i18n.define('', path, desc)
+      this._disposables.push(this.ctx.i18n.define('', path, desc))
       this._assignOption(option, aliases, this._namedOptions)
       this._assignOption(option, symbols, this._symbolicOptions)
       if (!this._namedOptions[param]) {
@@ -497,21 +369,32 @@ export namespace Argv {
       return true
     }
 
-    parse(argv: string | Argv, terminator?: string, args: any[] = [], options: Dict<any> = {}): Argv {
-      if (typeof argv === 'string') argv = Argv.parse(argv, terminator)
+    parse(argv: string | Argv, terminator?: string): Argv {
+      if (typeof argv === 'string') {
+        argv = Argv.parse(argv, terminator)
+      }
+      const args = [...argv.args || []]
+      const options = { ...argv.options }
 
       if (!argv.source && argv.tokens) {
         argv.source = this.name + ' ' + Argv.stringify(argv)
       }
 
+      let lastArgDecl: Declaration
+
       while (!argv.error && argv.tokens?.length) {
         const token = argv.tokens[0]
         let { content, quoted } = token
 
+        // variadic argument
+        const argDecl = this._arguments[args.length] || lastArgDecl || {}
+        if (args.length === this._arguments.length - 1 && argDecl.variadic) {
+          lastArgDecl = argDecl
+        }
+
         // greedy argument
-        const argDecl = this._arguments[args.length]
-        if (content[0] !== '-' && resolveConfig(argDecl?.type).greedy) {
-          args.push(Argv.parseValue(Argv.stringify(argv), true, 'argument', argv, argDecl))
+        if (content[0] !== '-' && this.ctx.$commander.resolveDomain(argDecl.type).greedy) {
+          args.push(this.ctx.$commander.parseValue(Argv.stringify(argv), 'argument', argv, argDecl))
           break
         }
 
@@ -525,21 +408,15 @@ export namespace Argv {
           names = [paramCase(option.name)]
         } else {
           // normal argument
-          if (content[0] !== '-' || quoted) {
-            args.push(Argv.parseValue(content, quoted, 'argument', argv, argDecl || { type: 'string' }))
+          if (content[0] !== '-' || quoted || (+content) * 0 === 0 && this.ctx.$commander.resolveDomain(argDecl.type).numeric) {
+            args.push(this.ctx.$commander.parseValue(content, 'argument', argv, argDecl))
             continue
           }
 
           // find -
           let i = 0
-          let name: string
           for (; i < content.length; ++i) {
             if (content.charCodeAt(i) !== 45) break
-          }
-          if (content.slice(i, i + 3) === 'no-' && !this._namedOptions[content.slice(i)]) {
-            name = content.slice(i + 3)
-            options[camelCase(name)] = false
-            continue
           }
 
           // find =
@@ -547,7 +424,20 @@ export namespace Argv {
           for (; j < content.length; j++) {
             if (content.charCodeAt(j) === 61) break
           }
-          name = content.slice(i, j)
+          const name = content.slice(i, j)
+          if (this.config.strictOptions && !this._namedOptions[name]) {
+            if (this.ctx.$commander.resolveDomain(argDecl.type).greedy) {
+              argv.tokens.unshift(token)
+              args.push(this.ctx.$commander.parseValue(Argv.stringify(argv), 'argument', argv, argDecl))
+              break
+            }
+            args.push(this.ctx.$commander.parseValue(content, 'argument', argv, argDecl))
+            continue
+          }
+          if (i > 1 && name.startsWith('no-') && !this._namedOptions[name]) {
+            options[camelCase(name.slice(3))] = false
+            continue
+          }
           names = i > 1 ? [name] : name
           param = content.slice(++j)
           option = this._namedOptions[names[names.length - 1]]
@@ -556,15 +446,19 @@ export namespace Argv {
         // get parameter from next token
         quoted = false
         if (!param) {
-          const { type } = option || {}
-          if (resolveConfig(type).greedy) {
+          const { type, values } = option || {}
+          if (this.ctx.$commander.resolveDomain(type).greedy) {
             param = Argv.stringify(argv)
             quoted = true
             argv.tokens = []
-          } else if (type !== 'boolean' && argv.tokens.length && (type || argv.tokens[0]?.content !== '-')) {
-            const token = argv.tokens.shift()
-            param = token.content
-            quoted = token.quoted
+          } else {
+            // Option has bounded value or option is boolean.
+            const isValued = names[names.length - 1] in (values || {}) || type === 'boolean'
+            if (!isValued && argv.tokens.length && (type || argv.tokens[0]?.content !== '-')) {
+              const token = argv.tokens.shift()
+              param = token.content
+              quoted = token.quoted
+            }
           }
         }
 
@@ -577,7 +471,7 @@ export namespace Argv {
             options[key] = optDecl.values[name]
           } else {
             const source = j + 1 < names.length ? '' : param
-            options[key] = Argv.parseValue(source, quoted, 'option', argv, optDecl)
+            options[key] = this.ctx.$commander.parseValue(source, 'option', argv, optDecl)
           }
           if (argv.error) break
         }

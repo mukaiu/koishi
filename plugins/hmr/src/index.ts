@@ -1,8 +1,9 @@
-import { coerce, Context, Dict, ForkScope, Logger, MainScope, makeArray, Schema } from 'koishi'
+import { coerce, Context, Dict, ForkScope, Logger, MainScope, makeArray, Plugin, Schema } from 'koishi'
 import { FSWatcher, watch, WatchOptions } from 'chokidar'
 import { relative, resolve } from 'path'
-import { debounce } from 'throttle-debounce'
+import { createRequire } from 'module'
 import { Loader, unwrapExports } from '@koishijs/loader'
+import { handleError } from './error'
 
 declare module 'koishi' {
   interface Context {
@@ -13,6 +14,10 @@ declare module 'koishi' {
     interface Config {
       watch?: Watcher.Config
     }
+  }
+
+  interface Events {
+    'hmr/reload'(reloads: Map<Plugin, Reload>): void
   }
 }
 
@@ -32,11 +37,12 @@ interface Reload {
   children: Map<ForkScope, string>
 }
 
-const logger = new Logger('watch')
-
 class Watcher {
+  static inject = ['loader']
+
   private base: string
   private watcher: FSWatcher
+  private require = createRequire(require.resolve('@koishijs/loader/package.json'))
 
   /**
    * changes from externals E will always trigger a full reload
@@ -64,9 +70,12 @@ class Watcher {
   /** stashed changes */
   private stashed = new Set<string>()
 
+  private logger: Logger
+
   constructor(private ctx: Context, private config: Watcher.Config) {
-    this.base = resolve(ctx.loader.baseDir, config.base || '')
-    ctx.root.watcher = this
+    this.base = resolve(ctx.baseDir, config.base || '')
+    this.logger = ctx.logger('hmr')
+    ctx.provide('watcher', this)
     ctx.on('ready', () => this.start())
     ctx.on('dispose', () => this.stop())
   }
@@ -86,8 +95,8 @@ class Watcher {
     })
 
     // files independent from any plugins will trigger a full reload
-    this.externals = loadDependencies(require.resolve('@koishijs/loader'), new Set(Object.values(loader.cache)))
-    const triggerLocalReload = debounce(this.config.debounce, () => this.triggerLocalReload())
+    this.externals = loadDependencies(require.resolve('koishi'), new Set(Object.values(loader.cache)))
+    const triggerLocalReload = this.ctx.debounce(() => this.triggerLocalReload(), this.config.debounce)
 
     this.watcher.on('change', async (path) => {
       const filename = resolve(this.base, path)
@@ -97,7 +106,7 @@ class Watcher {
         return
       }
 
-      logger.debug('change detected:', path)
+      this.logger.debug('change detected:', path)
 
       if (isEntry) {
         if (require.cache[filename]) {
@@ -186,27 +195,27 @@ class Watcher {
     this.analyzeChanges()
 
     /** plugins pending classification */
-    const pending = new Map<string, MainScope>()
+    const pending = new Map<string, [Plugin, MainScope]>()
 
     /** plugins that should be reloaded */
-    const reloads = new Map<MainScope, Reload>()
+    const reloads = new Map<Plugin, Reload>()
 
     // we assume that plugin entry files are "atomic"
     // that is, reloading them will not cause any other reloads
-    for (const filename in require.cache) {
+    for (const filename of Object.values(this.ctx.loader.cache)) {
       const module = require.cache[filename]
       const plugin = unwrapExports(module.exports)
+      if (!plugin || this.declined.has(filename)) continue
       const runtime = this.ctx.registry.get(plugin)
-      if (!runtime || this.declined.has(filename)) continue
-      pending.set(filename, runtime)
-      if (!plugin['sideEffect']) this.declined.add(filename)
+      pending.set(filename, [plugin, runtime])
+      this.declined.add(filename)
     }
 
-    for (const [filename, runtime] of pending) {
+    for (const [filename, [plugin, runtime]] of pending) {
       // check if it is a dependent of the changed file
       this.declined.delete(filename)
       const dependencies = [...loadDependencies(filename, this.declined)]
-      if (!runtime.plugin['sideEffect']) this.declined.add(filename)
+      this.declined.add(filename)
 
       // we only detect reloads at plugin level
       // a plugin will be reloaded if any of its dependencies are accepted
@@ -214,27 +223,31 @@ class Watcher {
       dependencies.forEach(dep => this.accepted.add(dep))
 
       // prepare for reload
-      let isMarked = false
-      const visited = new Set<MainScope>()
-      const queued = [runtime]
-      while (queued.length) {
-        const runtime = queued.shift()
-        if (visited.has(runtime)) continue
-        visited.add(runtime)
-        if (reloads.has(runtime)) {
-          isMarked = true
-          break
+      if (runtime) {
+        let isMarked = false
+        const visited = new Set<MainScope>()
+        const queued = [runtime]
+        while (queued.length) {
+          const runtime = queued.shift()
+          if (visited.has(runtime)) continue
+          visited.add(runtime)
+          if (reloads.has(plugin)) {
+            isMarked = true
+            break
+          }
+          for (const state of runtime.children) {
+            queued.push(state.runtime)
+          }
         }
-        for (const state of runtime.children) {
-          queued.push(state.runtime)
+        if (!isMarked) {
+          const children = new Map<ForkScope, string>()
+          reloads.set(plugin, { filename, children })
+          for (const state of runtime.children) {
+            children.set(state, this.ctx.loader.getRefName(state))
+          }
         }
-      }
-      if (!isMarked) {
-        const children = new Map<ForkScope, string>()
-        reloads.set(runtime, { filename, children })
-        for (const state of runtime.children) {
-          children.set(state, this.ctx.loader.getRefName(state))
-        }
+      } else {
+        reloads.set(plugin, { filename, children: new Map() })
       }
     }
 
@@ -257,46 +270,54 @@ class Watcher {
     const attempts = {}
     try {
       for (const [, { filename }] of reloads) {
-        attempts[filename] = unwrapExports(require(filename))
+        attempts[filename] = unwrapExports(this.require(filename))
       }
-    } catch (err) {
-      logger.warn(err)
+    } catch (e) {
+      handleError(e, this.logger)
       return rollback()
     }
 
+    // emit reload event before replacing loader cache
+    this.ctx.emit('hmr/reload', reloads)
+
     try {
-      for (const [runtime, { filename, children }] of reloads) {
+      for (const [plugin, { filename, children }] of reloads) {
         const path = this.relative(filename)
 
         try {
-          this.ctx.registry.delete(runtime.plugin)
+          this.ctx.registry.delete(plugin)
         } catch (err) {
-          logger.warn('failed to dispose plugin at %c\n' + coerce(err), path)
+          this.logger.warn('failed to dispose plugin at %c\n' + coerce(err), path)
         }
+
+        // replace loader cache for `keyFor` method
+        this.ctx.loader.replace(plugin, attempts[filename])
 
         try {
           for (const [state, name] of children) {
             const fork = state.parent.plugin(attempts[filename], state.config)
+            fork.key = state.key
             if (name) state.parent.scope[Loader.kRecord][name] = fork
           }
-          logger.info('reload plugin at %c', path)
+          this.logger.info('reload plugin at %c', path)
         } catch (err) {
-          logger.warn('failed to reload plugin at %c\n' + coerce(err), path)
+          this.logger.warn('failed to reload plugin at %c\n' + coerce(err), path)
           throw err
         }
       }
     } catch {
       // rollback require.cache and plugin states
       rollback()
-      for (const [runtime, { filename, children }] of reloads) {
+      for (const [plugin, { filename, children }] of reloads) {
         try {
           this.ctx.registry.delete(attempts[filename])
           for (const [state, name] of children) {
-            const fork = state.parent.plugin(runtime.plugin, state.config)
+            const fork = state.parent.plugin(plugin, state.config)
+            fork.key = state.key
             if (name) state.parent.scope[Loader.kRecord][name] = fork
           }
         } catch (err) {
-          logger.warn(err)
+          this.logger.warn(err)
         }
       }
       return
@@ -308,8 +329,6 @@ class Watcher {
 }
 
 namespace Watcher {
-  export const using = ['loader']
-
   export interface Config extends WatchOptions {
     base?: string
     root?: string[]
@@ -318,11 +337,11 @@ namespace Watcher {
   }
 
   export const Config: Schema<Config> = Schema.object({
-    base: Schema.string().description('用户显示路径的根目录，默认为当前工作路径。'),
+    base: Schema.string(),
     root: Schema.union([
       Schema.array(String).role('table'),
       Schema.transform(String, (value) => [value]),
-    ]).default(['.']).description('要监听的文件或目录列表，相对于 `base` 路径。'),
+    ]).default(['.']),
     ignored: Schema.union([
       Schema.array(String).role('table'),
       Schema.transform(String, (value) => [value]),
@@ -330,8 +349,10 @@ namespace Watcher {
       '**/node_modules/**',
       '**/.git/**',
       '**/logs/**',
-    ]).description('要忽略的文件或目录。使用 [Glob Patterns](https://github.com/micromatch/micromatch) 语法。'),
-    debounce: Schema.natural().role('ms').default(100).description('延迟触发更新的等待时间。'),
+    ]),
+    debounce: Schema.natural().role('ms').default(100),
+  }).i18n({
+    'zh-CN': require('./locales/zh-CN'),
   })
 }
 

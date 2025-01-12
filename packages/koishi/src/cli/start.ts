@@ -25,7 +25,9 @@ namespace Event {
 
 let child: ChildProcess
 
-process.env.KOISHI_SHARED = '{}'
+process.env.KOISHI_SHARED = JSON.stringify({
+  startTime: Date.now(),
+})
 
 function toArg(key: string) {
   return key.length === 1 ? `-${key}` : `--${hyphenate(key)}`
@@ -58,6 +60,7 @@ function createWorker(options: Dict<any>) {
     if (message.type === 'start') {
       config = message.body
       timer = config.heartbeatTimeout && setTimeout(() => {
+        // eslint-disable-next-line no-console
         console.log(kleur.red('daemon: heartbeat timeout'))
         child.kill('SIGKILL')
       }, config.heartbeatTimeout)
@@ -68,13 +71,29 @@ function createWorker(options: Dict<any>) {
     }
   })
 
-  function shouldExit(code: number) {
+  // https://nodejs.org/api/process.html#signal-events
+  // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signal
+  const signals: NodeJS.Signals[] = [
+    'SIGABRT',
+    'SIGBREAK',
+    'SIGBUS',
+    'SIGFPE',
+    'SIGHUP',
+    'SIGILL',
+    'SIGINT',
+    'SIGKILL',
+    'SIGSEGV',
+    'SIGSTOP',
+    'SIGTERM',
+  ]
+
+  function shouldExit(code: number, signal: NodeJS.Signals) {
     // start failed
     if (!config) return true
 
-    // exit manually or by signal
-    // https://tldp.org/LDP/abs/html/exitcodes.html
-    if (code === 0 || code >= 128 && code < 128 + 16) return true
+    // exit manually
+    if (code === 0) return true
+    if (signals.includes(signal)) return true
 
     // restart manually
     if (code === 51) return false
@@ -84,8 +103,8 @@ function createWorker(options: Dict<any>) {
     return !config.autoRestart
   }
 
-  child.on('exit', (code) => {
-    if (shouldExit(code)) {
+  child.on('exit', (code, signal) => {
+    if (shouldExit(code, signal)) {
       process.exit(code)
     }
     createWorker(options)
@@ -107,14 +126,13 @@ export default function (cli: CAC) {
     .option('--debug [namespace]', 'specify debug namespace')
     .option('--log-level [level]', 'specify log level (default: 2)')
     .option('--log-time [format]', 'show timestamp in logs')
-    .option('--watch [path]', 'watch and reload at change')
     .action((file, options) => {
-      const { logLevel, debug, logTime, watch, ...rest } = options
+      const { logLevel, debug, logTime, ...rest } = options
       if (logLevel !== undefined && (!isInteger(logLevel) || logLevel < 0)) {
+        // eslint-disable-next-line no-console
         console.warn(`${kleur.red('error')} log level should be a positive integer.`)
         process.exit(1)
       }
-      setEnvArg('KOISHI_WATCH_ROOT', watch) // for backward compatibility
       setEnvArg('KOISHI_LOG_TIME', logTime)
       process.env.KOISHI_LOG_LEVEL = logLevel || ''
       process.env.KOISHI_DEBUG = debug || ''

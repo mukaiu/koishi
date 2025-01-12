@@ -1,11 +1,12 @@
 {
   "name": "@koishijs/plugin-inspect",
   "description": "Inspect on any user, channel or message",
-  "version": "1.1.0",
+  "version": "1.1.7",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
-    "lib"
+    "lib",
+    "src"
   ],
   "author": "Shigma <shigma10826@gmail.com>",
   "license": "MIT",
@@ -46,10 +47,10 @@
     ]
   },
   "peerDependencies": {
-    "koishi": "^4.12.2"
+    "koishi": "^4.18.7"
   },
   "devDependencies": {
-    "@koishijs/plugin-mock": "^2.4.3",
-    "koishi": "^4.12.2"
+    "@koishijs/plugin-mock": "^2.6.6",
+    "koishi": "^4.18.7"
   }
 }

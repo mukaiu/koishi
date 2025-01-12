@@ -1,4 +1,5 @@
 import { Context, h, Schema } from 'koishi'
+import zhCN from './locales/zh-CN.yml'
 
 export const name = 'inspect'
 
@@ -7,14 +8,18 @@ export interface Config {}
 export const Config: Schema<Config> = Schema.object({})
 
 export function apply(ctx: Context) {
-  ctx.i18n.define('zh', require('./locales/zh-CN'))
+  ctx.i18n.define('zh-CN', zhCN)
 
-  ctx.command('inspect')
+  ctx.command('inspect', { captureQuote: false })
     .action(({ session }, target) => {
       if (session.quote) {
         return session.text('.message', {
-          ...session.quote,
+          platform: session.platform,
+          messageId: session.quote.id,
+          guildId: session.guildId,
           selfId: session.selfId,
+          userId: session.quote.user?.id,
+          channelId: session.quote.channel?.id,
         })
       }
 

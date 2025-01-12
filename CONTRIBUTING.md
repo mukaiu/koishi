@@ -25,7 +25,7 @@ Koishi 是一个相当大的仓库，包含了各种各样的插件和适配器�
 非常欢迎。不过目前 Koishi 的适配器和数据库的实现并不在官方仓库中，你或许应该去这里提交 Pull Request：
 
 - 适配器：[satorijs/satori](https://github.com/satorijs/satori)
-- 数据库：[shigma/minato](https://github.com/shigma/minato)
+- 数据库：[cordiverse/minato](https://github.com/cordiverse/minato)
 
 另外，适配器和数据库实现非常底层的东西，建议你在写之前熟悉一下 Koishi 的基本架构和文档。如果有什么疑问，也可以在 issues 或者官方群中提出。
 
@@ -64,7 +64,7 @@ Koishi 至今为止的官方插件数量已经非常非常多了，比起创建�
     - build: message
     - chore: message
     - docs: message
-3. 上面的 xxx 应该是下列词中的一个：core, cli, utils, test，以及官方适配器和插件的名字（例如 onebot, puppeteer 等）
+3. 上面的 xxx 应该是下列词中的一个：core, cli, utils, test，以及官方适配器和插件的名字（例如 discord, help 等）
 4. merge commit 等自动产生的 commit message 不受限制
 
 ## 项目结构

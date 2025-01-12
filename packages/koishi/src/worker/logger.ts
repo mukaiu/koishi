@@ -1,4 +1,4 @@
-import { Context, defineProperty, Logger, remove, Schema, version } from '@koishijs/core'
+import { Context, defineProperty, Logger, Schema } from '@koishijs/core'
 
 interface LogLevelConfig {
   // a little different from @koishijs/utils
@@ -26,14 +26,6 @@ defineProperty(Context.Config, 'logger', Config)
 Context.Config.list.push(Schema.object({
   logger: Config,
 }))
-
-const prologue: string[] = []
-
-const target: Logger.Target = {
-  colors: 3,
-  showTime: 'yyyy-MM-dd hh:mm:ss',
-  print: text => prologue.push(text),
-}
 
 export function prepare(config: Config = {}) {
   const { levels } = config
@@ -70,15 +62,5 @@ export function prepare(config: Config = {}) {
     }
   }
 
-  Logger.targets.push(target)
-
-  new Logger('app').info('%C', `Koishi/${version}`)
-  Logger.timestamp = Date.now()
-}
-
-export function apply(app: Context) {
-  app.prologue = prologue
-  app.on('ready', () => {
-    remove(Logger.targets, target)
-  })
+  Logger.targets[0].timestamp = Date.now()
 }

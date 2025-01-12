@@ -1,15 +1,13 @@
-#!/usr/bin/env node
-
 import registerStartCommand from './start'
-import CAC from 'cac'
+import { cac } from 'cac'
 
 const { version } = require('../../package.json')
-const cli = CAC('koishi').help().version(version)
+const cli = cac('koishi').help().version(version)
 
 registerStartCommand(cli)
 
-cli.parse()
+const argv = cli.parse()
 
-if (!cli.matchedCommand) {
+if (!cli.matchedCommand && !argv.options.help) {
   cli.outputHelp()
 }

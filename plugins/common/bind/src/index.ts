@@ -8,20 +8,20 @@ export interface Config {
 }
 
 export const name = 'bind'
-export const using = ['database'] as const
+export const inject = ['database']
 export const Config: Schema<Config> = Schema.object({
   generateToken: Schema.function().hidden(),
 })
 
 export function apply(ctx: Context, config: Config = {}) {
-  ctx.i18n.define('zh', zhCN)
-  ctx.i18n.define('en', enUS)
+  ctx.i18n.define('zh-CN', zhCN)
+  ctx.i18n.define('en-US', enUS)
 
   // 1: group (1st step)
   // 0: private
   // -1: group (2nd step)
   type TokenData = [platform: string, id: string, phase: number]
-  const tokens: Dict<TokenData> = {}
+  const tokens: Dict<TokenData> = Object.create(null)
 
   const { tokenPrefix: prefix = 'koishi/' } = config
   const { generateToken = () => `${prefix}` + Random.id(6, 10) } = config
@@ -61,14 +61,18 @@ export function apply(ctx: Context, config: Config = {}) {
         }
       }
 
-      const token = generate(session, +(session.subtype !== 'private'))
+      const token = generate(session, +!session.isDirect)
       return session.text('.generated-1', [token])
     })
 
   ctx.middleware(async (session, next) => {
-    const data = tokens[session.content]
+    const token = session.stripped.content
+    const data = tokens[token]
     if (!data) return next()
-    delete tokens[session.content]
+    if (data[0] === session.platform && data[1] === session.userId) {
+      return session.text('commands.bind.messages.self-' + (data[2] < 0 ? '2' : '1'))
+    }
+    delete tokens[token]
     if (data[2] < 0) {
       const [binding] = await ctx.database.get('binding', { platform: data[0], pid: data[1] }, ['aid'])
       await bind(binding.aid, session.platform, session.userId)

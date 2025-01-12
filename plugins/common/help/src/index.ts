@@ -1,14 +1,11 @@
 import { Argv, Command, Computed, Context, FieldCollector, h, Schema, Session } from 'koishi'
 import zhCN from './locales/zh-CN.yml'
 import enUS from './locales/en-US.yml'
-import jaJP from './locales/ja-JP.yml'
-import frFR from './locales/fr-FR.yml'
-import zhTW from './locales/zh-TW.yml'
 
 declare module 'koishi' {
   interface Events {
-    'help/command'(output: string[], command: Command, session: Session): void
-    'help/option'(output: string, option: Argv.OptionVariant, command: Command, session: Session): string
+    'help/command'(output: string[], command: Command, session: Session<never, never>): void
+    'help/option'(output: string, option: Argv.OptionVariant, command: Command, session: Session<never, never>): string
   }
 
   namespace Command {
@@ -34,7 +31,6 @@ declare module 'koishi' {
 
 interface HelpOptions {
   showHidden?: boolean
-  authority?: boolean
 }
 
 export interface Config {
@@ -47,8 +43,8 @@ export const Config: Schema<Config> = Schema.object({
   options: Schema.boolean().default(true).description('是否为每个指令添加 `-h, --help` 选项。'),
 })
 
-function executeHelp(session: Session, name: string) {
-  if (!session.app.$commander.getCommand('help')) return
+function executeHelp(session: Session<never, never>, name: string) {
+  if (!session.app.$commander.get('help')) return
   return session.execute({
     name: 'help',
     args: [name],
@@ -58,11 +54,8 @@ function executeHelp(session: Session, name: string) {
 export const name = 'help'
 
 export function apply(ctx: Context, config: Config) {
-  ctx.i18n.define('zh', zhCN)
-  ctx.i18n.define('en', enUS)
-  ctx.i18n.define('ja', jaJP)
-  ctx.i18n.define('fr', frFR)
-  ctx.i18n.define('zh-TW', zhTW)
+  ctx.i18n.define('zh-CN', zhCN)
+  ctx.i18n.define('en-US', enUS)
 
   function enableHelp(command: Command) {
     command[Context.current] = ctx
@@ -101,14 +94,14 @@ export function apply(ctx: Context, config: Config) {
   })
 
   const $ = ctx.$commander
-  function findCommand(target: string, session: Session) {
-    const command = $.resolve(target)
-    if (command?.match(session)) return command
+  function findCommand(target: string, session: Session<never, never>) {
+    const command = $.resolve(target, session)
+    if (command?.ctx.filter(session)) return command
 
     // shortcuts
     const data = ctx.i18n
       .find('commands.(name).shortcuts.(variant)', target)
-      .map(item => ({ ...item, command: $.resolve(item.data.name) }))
+      .map(item => ({ ...item, command: $.resolve(item.data.name, session) }))
       .filter(item => item.command?.match(session))
     const perfect = data.filter(item => item.similarity === 1)
     if (!perfect.length) return data
@@ -138,32 +131,41 @@ export function apply(ctx: Context, config: Config) {
       if (expect.includes(item.data.name)) continue
       expect.push(item.data.name)
     }
+    const cache = new Map<string, Promise<boolean>>()
     const name = await session.suggest({
       expect,
       prefix: session.text('.not-found'),
       suffix: session.text('internal.suggest-command'),
+      filter: (name) => {
+        const command = $.resolve(name, session)
+        if (!command) return false
+        return ctx.permissions.test(`command:${command.name}`, session, cache)
+      },
     })
-    return $.resolve(name)
+    return $.resolve(name, session)
   }
 
   const cmd = ctx.command('help [command:string]', { authority: 0, ...config })
     .userFields(['authority'])
     .userFields(createCollector('user'))
     .channelFields(createCollector('channel'))
-    .option('authority', '-a')
     .option('showHidden', '-H')
     .action(async ({ session, options }, target) => {
       if (!target) {
-        const prefix = session.resolve(session.app.config.prefix)[0] ?? ''
+        const prefix = session.resolve(session.app.koishi.config.prefix)[0] ?? ''
         const commands = $._commandList.filter(cmd => cmd.parent === null)
-        const output = formatCommands('.global-prolog', session, commands, options)
+        const output = await formatCommands('.global-prolog', session, commands, options)
         const epilog = session.text('.global-epilog', [prefix])
         if (epilog) output.push(epilog)
         return output.filter(Boolean).join('\n')
       }
 
       const command = await inferCommand(target, session)
-      if (command) return showHelp(command, session, options)
+      if (!command) return
+      if (!await ctx.permissions.test(`command:${command.name}`, session)) {
+        return session.text('internal.low-authority')
+      }
+      return showHelp(command, session, options)
     })
 
   if (config.shortcut !== false) cmd.shortcut('help', { i18n: true, fuzzy: true })
@@ -172,7 +174,7 @@ export function apply(ctx: Context, config: Config) {
 function* getCommands(session: Session<'authority'>, commands: Command[], showHidden = false): Generator<Command> {
   for (const command of commands) {
     if (!showHidden && session.resolve(command.config.hidden)) continue
-    if (command.match(session)) {
+    if (command.match(session) && Object.keys(command._aliases).length) {
       yield command
     } else {
       yield* getCommands(session, command.children, showHidden)
@@ -180,26 +182,25 @@ function* getCommands(session: Session<'authority'>, commands: Command[], showHi
   }
 }
 
-function formatCommands(path: string, session: Session<'authority'>, children: Command[], options: HelpOptions) {
-  const commands = Array
-    .from(getCommands(session, children, options.showHidden))
-    .sort((a, b) => a.displayName > b.displayName ? 1 : -1)
-  if (!commands.length) return []
+async function formatCommands(path: string, session: Session<'authority'>, children: Command[], options: HelpOptions) {
+  const cache = new Map<string, Promise<boolean>>()
+  // Step 1: filter commands by visibility
+  children = Array.from(getCommands(session, children, options.showHidden))
+  // Step 2: filter commands by permission
+  children = (await Promise.all(children.map(async (command) => {
+    return [command, await session.app.permissions.test(`command:${command.name}`, session, cache)] as const
+  }))).filter(([, result]) => result).map(([command]) => command)
+  // Step 3: sort commands by name
+  children.sort((a, b) => a.displayName > b.displayName ? 1 : -1)
+  if (!children.length) return []
 
-  let hasSubcommand = false
-  const prefix = session.resolve(session.app.config.prefix)[0] ?? ''
-  const output = commands.map(({ name, displayName, config, children }) => {
-    let output = '    ' + prefix + displayName
-    if (options.authority) {
-      const authority = session.resolve(config.authority)
-      output += ` (${authority}${children.length ? (hasSubcommand = true, '*') : ''})`
-    }
+  const prefix = session.resolve(session.app.koishi.config.prefix)[0] ?? ''
+  const output = children.map(({ name, displayName, config }) => {
+    let output = '    ' + prefix + displayName.replace(/\./g, ' ')
     output += '  ' + session.text([`commands.${name}.description`, ''], config.params)
     return output
   })
   const hints: string[] = []
-  if (options.authority) hints.push(session.text('.hint-authority'))
-  if (hasSubcommand) hints.push(session.text('.hint-subcommand'))
   const hintText = hints.length
     ? session.text('general.paren', [hints.join(session.text('general.comma'))])
     : ''
@@ -221,10 +222,9 @@ function getOptions(command: Command, session: Session<'authority'>, config: Hel
 
   const output: string[] = []
   Object.values(command._options).forEach((option) => {
-    const authority = option.authority && config.authority ? `(${option.authority}) ` : ''
     function pushOption(option: Argv.OptionVariant, name: string) {
       if (!config.showHidden && !getOptionVisibility(option, session)) return
-      let line = `${authority}${h.escape(option.syntax)}`
+      let line = `${h.escape(option.syntax)}`
       const description = session.text(option.descPath ?? [`commands.${command.name}.options.${name}`, ''], option.params)
       if (description) line += '  ' + description
       line = command.ctx.chain('help/option', line, option, command, session)
@@ -238,14 +238,12 @@ function getOptions(command: Command, session: Session<'authority'>, config: Hel
   })
 
   if (!output.length) return []
-  output.unshift(config.authority && options.some(o => o.authority)
-    ? session.text('.available-options-with-authority')
-    : session.text('.available-options'))
+  output.unshift(session.text('.available-options'))
   return output
 }
 
 async function showHelp(command: Command, session: Session<'authority'>, config: HelpOptions) {
-  const output = [session.text('.command-title', [command.displayName + command.declaration])]
+  const output = [session.text('.command-title', [command.displayName.replace(/\./g, ' ') + command.declaration])]
 
   const description = session.text([`commands.${command.name}.description`, ''], command.config.params)
   if (description) output.push(description)
@@ -254,24 +252,17 @@ async function showHelp(command: Command, session: Session<'authority'>, config:
     const argv: Argv = { command, args: [], options: { help: true } }
     const userFields = session.collect('user', argv)
     await session.observeUser(userFields)
-    if (session.subtype === 'group') {
+    if (!session.isDirect) {
       const channelFields = session.collect('channel', argv)
       await session.observeChannel(channelFields)
     }
   }
 
-  if (command._aliases.length > 1) {
-    output.push(session.text('.command-aliases', [Array.from(command._aliases.slice(1)).join('，')]))
+  if (Object.keys(command._aliases).length > 1) {
+    output.push(session.text('.command-aliases', [Array.from(Object.keys(command._aliases).slice(1)).join('，')]))
   }
 
   session.app.emit(session, 'help/command', output, command, session)
-
-  if (session.user) {
-    const authority = session.resolve(command.config.authority)
-    if (authority > 1) {
-      output.push(session.text('.command-authority', [authority]))
-    }
-  }
 
   if (command._usage) {
     output.push(typeof command._usage === 'string' ? command._usage : await command._usage(session))
@@ -289,7 +280,7 @@ async function showHelp(command: Command, session: Session<'authority'>, config:
     if (text) output.push(...text.split('\n').map(line => '    ' + line))
   }
 
-  output.push(...formatCommands('.subcommand-prolog', session, command.children, config))
+  output.push(...await formatCommands('.subcommand-prolog', session, command.children, config))
 
   return output.filter(Boolean).join('\n')
 }

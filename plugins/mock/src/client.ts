@@ -1,5 +1,5 @@
 import assert from 'assert'
-import { Context, h, hyphenate, isNullable, Messenger, SendOptions, Session, Universal } from 'koishi'
+import { clone, Context, Dict, h, hyphenate, isNullable, MessageEncoder, Universal } from 'koishi'
 import { format } from 'util'
 import { MockBot } from './adapter'
 
@@ -9,18 +9,13 @@ const RECEIVED_OTHERWISE = 'expected "%s" to be replied with %s but received "%s
 const RECEIVED_NTH_NOTHING = 'expected "%s" to be replied at index %s but received nothing'
 const RECEIVED_NTH_OTHERWISE = 'expected "%s" to be replied with %s at index %s but received "%s"'
 
-export class MockMessenger extends Messenger {
+export class MockMessageEncoder extends MessageEncoder<Context, MockBot> {
   private buffer = ''
-
-  constructor(private client: MessageClient, options?: SendOptions) {
-    super(client.bot, client.meta.channelId, client.meta.guildId, options)
-  }
 
   async flush() {
     this.buffer = this.buffer.trim()
     if (!this.buffer) return
-    this.client.replies.push(this.buffer)
-    this.client.resolve(true)
+    this.options.session?.['client']?.flush(this.buffer)
     this.buffer = ''
   }
 
@@ -33,11 +28,9 @@ export class MockMessenger extends Messenger {
     } else if (type === 'text') {
       this.buffer += attrs.content
     } else if (type === 'p') {
-      if (!this.buffer.endsWith('\n')) {
-        this.buffer += '\n'
-      }
+      if (!this.buffer.endsWith('\n')) this.buffer += '\n'
       await this.render(children)
-      this.buffer += '\n'
+      if (!this.buffer.endsWith('\n')) this.buffer += '\n'
     } else if (type === 'template' || !type) {
       await this.render(children)
     } else {
@@ -49,71 +42,92 @@ export class MockMessenger extends Messenger {
         return ` ${key}="${h.escape('' + value, true)}"`
       }).join('')
       this.buffer += `<${type}${attrString}>`
+      const length = this.buffer.length
       await this.render(children)
-      this.buffer += `</${type}>`
+      if (this.buffer.length === length) {
+        this.buffer = this.buffer.slice(0, -1) + `/>`
+      } else {
+        this.buffer += `</${type}>`
+      }
     }
   }
 }
 
+interface Hook {
+  count: number
+  done?: boolean
+  resolve?: (replies: string[]) => void
+}
+
+let counter = 0
+
 export class MessageClient {
   public app: Context
-  public meta: Session.Payload & Partial<Session>
-  public resolve: (checkLength?: boolean) => void
-  public replies: string[] = []
+  public event: Universal.Event
+
+  private replies: string[] = []
+  private hooks: Dict<Hook> = {}
 
   constructor(public bot: MockBot, public userId: string, public channelId?: string) {
     this.app = bot.ctx.root
-    this.meta = {
+    this.event = {
       platform: 'mock',
       type: 'message',
       selfId: bot.selfId,
-      userId,
-      author: {
-        userId,
-        username: '' + userId,
-      },
-    }
+      user: { id: userId, name: '' + userId },
+    } as Universal.Event
 
     if (channelId) {
-      this.meta.guildId = channelId
-      this.meta.channelId = channelId
-      this.meta.subtype = 'group'
+      this.event.guild = { id: channelId }
+      this.event.channel = { id: channelId, type: Universal.Channel.Type.TEXT }
     } else {
-      this.meta.channelId = 'private:' + userId
-      this.meta.subtype = 'private'
+      this.event.channel = { id: 'private:' + userId, type: Universal.Channel.Type.DIRECT }
     }
 
-    const self = this
-    this.resolve = () => {}
-    this.meta.send = function (this: Session, fragment, options = {}) {
-      options.session = this
-      return new MockMessenger(self, options).send(fragment)
+    this.app.on('middleware', (session) => {
+      const hook = this.hooks[session.id]
+      if (!hook) return
+      hook.done = true
+      if (!hook.resolve) delete this.hooks[session.id]
+      if (Object.values(this.hooks).every(hook => hook.done)) {
+        this.flush()
+        this.hooks = {}
+      }
+    })
+  }
+
+  flush(buffer?: string) {
+    if (buffer) this.replies.push(buffer)
+    for (const id in this.hooks) {
+      const hook = this.hooks[id]
+      if (!hook.resolve || buffer && this.replies.length < hook.count) continue
+      hook.resolve(this.replies)
+      hook.resolve = undefined
+      hook.count = Infinity
+      this.replies = []
     }
   }
 
   async receive(content: string, count = Infinity) {
-    return new Promise<string[]>((resolve) => {
-      let resolved = false
-      this.resolve = (checkLength = false) => {
-        if (resolved) return
-        if (checkLength && this.replies.length < count) return
-        resolved = true
-        dispose()
-        resolve(this.replies)
-        this.replies = []
-      }
-      const dispose = this.app.on('middleware', (session) => {
-        if (session.id === uuid) process.nextTick(this.resolve)
-      })
+    const result = await new Promise<string[]>((resolve) => {
       let quote: Universal.Message
-      const elements = h.parse(content)
+      let elements = h.parse(content)
       if (elements[0]?.type === 'quote') {
         const { attrs, children } = elements.shift()
-        quote = { messageId: attrs.id, elements: children, content: children.join('') }
-        content = elements.join('')
+        quote = { id: attrs.id, messageId: attrs.id, elements: children, content: children.join('') }
+        content = elements.join('').trimStart()
+        elements = h.parse(content)
       }
-      const uuid = this.bot.receive({ ...this.meta, content, elements, quote })
+      const id = this.bot.receive({
+        ...clone(this.event),
+        message: { id: ++counter + '', content, elements, quote },
+      }, this)
+      this.hooks[id] = { resolve, count }
     })
+    // Await for next tick to ensure subsequent operations are executed.
+    // Do not use `setTimeout` because it may break tests with mocked timers.
+    await new Promise(process.nextTick)
+    return result
   }
 
   async shouldReply(message: string, reply?: string | RegExp | (string | RegExp)[]) {

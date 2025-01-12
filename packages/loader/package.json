@@ -1,23 +1,30 @@
 {
   "name": "@koishijs/loader",
   "description": "Config Loader for Koishi",
-  "version": "3.1.2",
+  "version": "4.6.7",
   "main": "lib/index.js",
-  "module": "lib/shared.mjs",
-  "typings": "lib/index.d.ts",
+  "module": "lib/index.mjs",
+  "types": "lib/index.d.ts",
   "exports": {
     ".": {
-      "require": "./lib/index.js",
-      "import": "./lib/shared.mjs"
+      "types": "./lib/index.d.ts",
+      "node": {
+        "require": "./lib/index.js",
+        "import": "./lib/index.mjs"
+      },
+      "browser": "./lib/shared.mjs"
     },
     "./shared": {
+      "types": "./lib/shared.d.ts",
       "require": "./lib/shared.js",
       "import": "./lib/shared.mjs"
     },
+    "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
   "files": [
-    "lib"
+    "lib",
+    "src"
   ],
   "author": "Shigma <shigma10826@gmail.com>",
   "license": "MIT",
@@ -38,14 +45,14 @@
     "config"
   ],
   "peerDependencies": {
-    "@koishijs/core": "4.12.2"
+    "@koishijs/core": "4.18.7"
   },
   "devDependencies": {
-    "@koishijs/core": "4.12.2",
-    "@types/js-yaml": "^4.0.5"
+    "@koishijs/core": "4.18.7",
+    "@types/js-yaml": "^4.0.9"
   },
   "dependencies": {
-    "dotenv": "^16.0.3",
+    "dotenv": "^16.4.5",
     "js-yaml": "^4.1.0",
     "ns-require": "^1.1.4"
   }

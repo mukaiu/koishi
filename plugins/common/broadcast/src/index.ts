@@ -1,14 +1,14 @@
 import { Channel, Context, Schema } from 'koishi'
-import zh from './locales/zh.yml'
+import zhCN from './locales/zh-CN.yml'
 
 export interface Config {}
 
 export const name = 'broadcast'
-export const using = ['database'] as const
+export const inject = ['database']
 export const Config: Schema<Config> = Schema.object({})
 
 export function apply(ctx: Context) {
-  ctx.i18n.define('zh', zh)
+  ctx.i18n.define('zh-CN', zhCN)
 
   ctx.command('broadcast <message:text>', { authority: 4 })
     .option('forced', '-f')

@@ -1,5 +1,5 @@
 import { Context, h, RuntimeError, Schema, Session } from 'koishi'
-import zh from './locales/zh.yml'
+import zhCN from './locales/zh-CN.yml'
 
 declare module 'koishi' {
   interface Events {
@@ -10,11 +10,11 @@ declare module 'koishi' {
 export interface Config {}
 
 export const name = 'callme'
-export const using = ['database'] as const
+export const inject = ['database']
 export const Config: Schema<Config> = Schema.object({})
 
 export function apply(ctx: Context) {
-  ctx.i18n.define('zh', zh)
+  ctx.i18n.define('zh-CN', zhCN)
 
   ctx.command('callme [name:text]')
     .userFields(['id', 'name'])

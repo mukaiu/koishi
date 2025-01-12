@@ -1,6 +1,6 @@
 import { Context } from 'koishi'
 import * as bind from '@koishijs/plugin-bind'
-import memory from '@koishijs/plugin-database-memory'
+import memory from '@minatojs/driver-memory'
 import mock from '@koishijs/plugin-mock'
 
 const app = new Context()
@@ -32,7 +32,9 @@ describe('@koishijs/plugin-bind', () => {
     await client1.shouldReply('name', 'foo')
     await client2.shouldReply('name', 'bar')
     await client1.shouldReply('bind', /^koishi\/000001$/m)
+    await client1.shouldReply('koishi/000001', '请前往原始平台输入。')
     await client2.shouldReply('koishi/000001', /^koishi\/000002$/m)
+    await client2.shouldReply('koishi/000002', '请前往目标平台输入。')
     await client1.shouldReply('koishi/000002', '账号绑定成功！')
     await client1.shouldReply('name', 'bar')
     await client2.shouldReply('name', 'bar')

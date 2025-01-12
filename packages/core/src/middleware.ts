@@ -1,13 +1,14 @@
 import { coerce, makeArray, Random } from '@koishijs/utils'
 import { Awaitable, defineProperty, Dict, Time } from 'cosmokit'
-import { Context, Fragment, h, Session } from '@satorijs/core'
-import { Computed } from './filter'
+import { EventOptions, Fragment, h, Hook } from '@satorijs/core'
+import { Session } from './session'
+import { Context } from './context'
 import { Channel, User } from './database'
 
-declare module '@satorijs/core' {
+declare module './context' {
   interface Context {
-    $internal: Processor
-    middleware(middleware: Middleware, prepend?: boolean): () => boolean
+    $processor: Processor
+    middleware<S extends Session = Session>(middleware: Middleware<S>, prepend?: boolean): () => boolean
     match(pattern: string | RegExp, response: Fragment, options?: Matcher.Options & { i18n?: false }): () => boolean
     match(pattern: string, response: string, options: Matcher.Options & { i18n: true }): () => boolean
   }
@@ -30,7 +31,7 @@ export class SessionError extends Error {
 }
 
 export type Next = (next?: Next.Callback) => Promise<void | Fragment>
-export type Middleware = (session: Session, next: Next) => Awaitable<void | Fragment>
+export type Middleware<S extends Session = Session> = (session: S, next: Next) => Awaitable<void | Fragment>
 
 export namespace Next {
   export const MAX_DEPTH = 64
@@ -60,27 +61,18 @@ export namespace Matcher {
   }
 }
 
-export namespace Processor {
-  export interface Config {
-    nickname?: Computed<string[]>
-    prefix?: Computed<string[]>
-  }
-}
-
 export class Processor {
-  static readonly methods = ['middleware', 'match']
-
-  _hooks: [Context, Middleware][] = []
+  _hooks: Hook[] = []
   _sessions: Dict<Session> = Object.create(null)
-  _userCache = new SharedCache<User.Observed<any>>()
-  _channelCache = new SharedCache<Channel.Observed<any>>()
+  _userCache = new SharedCache<User.Observed<keyof User>>()
+  _channelCache = new SharedCache<Channel.Observed<keyof Channel>>()
   _matchers = new Set<Matcher>()
 
-  constructor(private ctx: Context, private config: Processor.Config) {
+  constructor(private ctx: Context) {
     defineProperty(this, Context.current, ctx)
 
     // bind built-in event listeners
-    this.middleware(this._process.bind(this), true)
+    this.middleware(this.attach.bind(this), true)
     ctx.on('message', this._handleMessage.bind(this))
 
     ctx.before('attach-user', (session, fields) => {
@@ -101,7 +93,7 @@ export class Processor {
     }, { session: true })
 
     ctx.component('i18n', async (attrs, children, session) => {
-      return session.text(attrs.path, children)
+      return session.i18n(attrs.path, children)
     }, { session: true })
 
     ctx.component('random', async (attrs, children) => {
@@ -140,29 +132,28 @@ export class Processor {
     })
   }
 
-  protected get caller() {
-    return this[Context.current] as Context
-  }
-
-  middleware(middleware: Middleware, prepend = false) {
-    return this.caller.lifecycle.register('middleware', this._hooks, middleware, prepend)
+  middleware(middleware: Middleware, options?: boolean | EventOptions) {
+    if (typeof options !== 'object') {
+      options = { prepend: options }
+    }
+    return this.ctx.lifecycle.register('middleware', this._hooks, middleware, options)
   }
 
   match(pattern: string | RegExp, response: Matcher.Response, options: Matcher.Options) {
-    const matcher: Matcher = { ...options, context: this.caller, pattern, response }
+    const matcher: Matcher = { ...options, context: this.ctx, pattern, response }
     this._matchers.add(matcher)
-    return this.caller.collect('shortcut', () => {
+    return this.ctx.collect('shortcut', () => {
       return this._matchers.delete(matcher)
     })
   }
 
   private _executeMatcher(session: Session, matcher: Matcher) {
-    const { parsed, quote } = session
+    const { stripped, quote } = session
     const { appel, context, i18n, regex, fuzzy, pattern, response } = matcher
-    if ((appel || parsed.hasMention) && !parsed.appel) return
+    if ((appel || stripped.hasAt) && !stripped.appel) return
     if (!context.filter(session)) return
-    let content = parsed.content
-    if (quote) content += ' ' + quote.content
+    let content = stripped.content
+    if (quote?.content) content += ' ' + quote.content
 
     let params: [string, ...string[]] = null
     const match = (pattern: any) => {
@@ -170,7 +161,7 @@ export class Processor {
       if (typeof pattern === 'string') {
         if (!fuzzy && content !== pattern || !content.startsWith(pattern)) return
         params = [content, content.slice(pattern.length)]
-        if (fuzzy && !parsed.appel && params[1].match(/^\S/)) {
+        if (fuzzy && !stripped.appel && params[1].match(/^\S/)) {
           params = null
         }
       } else {
@@ -181,17 +172,17 @@ export class Processor {
     if (!i18n) {
       match(pattern)
     } else {
-      for (const locale in this.ctx.i18n._data) {
+      for (const locale of this.ctx.i18n.fallback([])) {
         const store = this.ctx.i18n._data[locale]
-        let value = store[pattern as string] as string | RegExp
+        let value = store?.[pattern as string] as string | RegExp
         if (!value) continue
         if (regex) {
-          const rest = fuzzy ? `(?:${parsed.appel ? '' : '\\s+'}([\\s\\S]*))?` : ''
+          const rest = fuzzy ? `(?:${stripped.appel ? '' : '\\s+'}([\\s\\S]*))?` : ''
           value = new RegExp(`^(?:${value})${rest}$`)
         }
         match(value)
         if (!params) continue
-        session.locale = locale
+        session.locales = [locale]
         break
       }
     }
@@ -203,61 +194,16 @@ export class Processor {
     }
   }
 
-  private _stripNickname(session: Session, content: string) {
-    if (content.startsWith('@')) content = content.slice(1)
-    for (const nickname of session.resolve(this.config.nickname) ?? []) {
-      if (!content.startsWith(nickname)) continue
-      const rest = content.slice(nickname.length)
-      const capture = /^([,，]\s*|\s+)/.exec(rest)
-      if (!capture) continue
-      return rest.slice(capture[0].length)
-    }
-  }
-
-  private async _process(session: Session, next: Next) {
-    let atSelf = false, appel = false
-    let content = session.content.trim()
-    session.elements ??= h.parse(content)
-
-    // strip mentions
-    let hasMention = false
-    const elements = session.elements.slice()
-    while (elements[0]?.type === 'at') {
-      const { attrs } = elements.shift()
-      if (attrs.id === session.selfId) {
-        atSelf = appel = true
-      }
-      // quote messages may contain mentions
-      if (!session.quote || session.quote.userId !== attrs.id) {
-        hasMention = true
-      }
-      content = elements.join('').trimStart()
-      // @ts-ignore
-      if (elements[0]?.type === 'text' && !elements[0].attrs.content.trim()) {
-        elements.shift()
-      }
-    }
-
-    if (!hasMention) {
-      // strip nickname
-      const result = this._stripNickname(session, content)
-      if (result) {
-        appel = true
-        content = result
-      }
-    }
-
-    // store parsed message
-    defineProperty(session, 'parsed', { hasMention, content, appel, prefix: null })
+  private async attach(session: Session, next: Next) {
     this.ctx.emit(session, 'before-attach', session)
 
     if (this.ctx.database) {
-      if (session.subtype === 'group') {
+      if (!session.isDirect) {
         // attach group data
-        const channelFields = new Set<Channel.Field>(['flag', 'assignee', 'guildId', 'locale'])
+        const channelFields = new Set<Channel.Field>(['flag', 'assignee', 'guildId', 'permissions', 'locales'])
         this.ctx.emit('before-attach-channel', session, channelFields)
         const channel = await session.observeChannel(channelFields)
-        // for backwards compatibility (TODO remove in v5)
+        // for backwards compatibility
         channel.guildId = session.guildId
 
         // emit attach event
@@ -265,12 +211,12 @@ export class Processor {
 
         // ignore some group calls
         if (channel.flag & Channel.Flag.ignore) return
-        if (channel.assignee !== session.selfId && !atSelf) return
+        if (channel.assignee !== session.selfId && !session.stripped.atSelf) return
       }
 
       // attach user data
       // authority is for suggestion
-      const userFields = new Set<User.Field>(['flag', 'authority', 'locale'])
+      const userFields = new Set<User.Field>(['id', 'flag', 'authority', 'permissions', 'locales'])
       this.ctx.emit('before-attach-user', session, userFields)
       const user = await session.observeUser(userFields)
 
@@ -292,9 +238,9 @@ export class Processor {
 
     // preparation
     this._sessions[session.id] = session
-    const queue: Next.Queue = this._hooks
-      .filter(([context]) => context.filter(session))
-      .map(([, middleware]) => middleware.bind(null, session))
+    const queue: Next.Queue = this.ctx.lifecycle
+      .filterHooks(this._hooks, session)
+      .map(({ callback }) => callback.bind(null, session))
 
     // execute middlewares
     let index = 0
@@ -337,42 +283,41 @@ export class Processor {
   }
 }
 
-Context.service('$internal', Processor)
-
 export namespace SharedCache {
   export interface Entry<T> {
     value: T
     key: string
-    refs: Set<string>
+    refs: Set<number>
   }
 }
 
 export class SharedCache<T> {
-  #keyMap: Dict<SharedCache.Entry<T>> = Object.create(null)
+  #keyMap = new Map<string, SharedCache.Entry<T>>()
 
-  get(ref: string, key: string) {
-    const entry = this.#keyMap[key]
+  get(ref: number, key: string) {
+    const entry = this.#keyMap.get(key)
     if (!entry) return
     entry.refs.add(ref)
     return entry.value
   }
 
-  set(ref: string, key: string, value: T) {
-    let entry = this.#keyMap[key]
+  set(ref: number, key: string, value: T) {
+    let entry = this.#keyMap.get(key)
     if (entry) {
       entry.value = value
     } else {
-      entry = this.#keyMap[key] = { value, key, refs: new Set() }
+      entry = { value, key, refs: new Set() }
+      this.#keyMap.set(key, entry)
     }
     entry.refs.add(ref)
   }
 
-  delete(ref: string) {
-    for (const key in this.#keyMap) {
-      const { refs } = this.#keyMap[key]
+  delete(ref: number) {
+    for (const key of [...this.#keyMap.keys()]) {
+      const { refs } = this.#keyMap.get(key)
       refs.delete(ref)
       if (!refs.size) {
-        delete this.#keyMap[key]
+        this.#keyMap.delete(key)
       }
     }
   }

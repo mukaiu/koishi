@@ -1,14 +1,12 @@
-import { App, User, Channel, Command, sleep } from 'koishi'
+import { App, User, Channel, sleep } from 'koishi'
 import mock, { DEFAULT_SELF_ID } from '@koishijs/plugin-mock'
-import memory from '@koishijs/plugin-database-memory'
+import memory from '@minatojs/driver-memory'
+import { install } from '@sinonjs/fake-timers'
 
 const app = new App()
 
 app.plugin(memory)
 app.plugin(mock)
-
-// make coverage happy
-Command.channelFields([])
 
 const client1 = app.mock.client('123')
 const client2 = app.mock.client('456')
@@ -53,7 +51,7 @@ describe('Runtime', () => {
   describe('Command Prefix', () => {
     it('single prefix', async () => {
       // also support functions
-      app.config.prefix = () => '>'
+      app.koishi.config.prefix = () => '>'
 
       await client1.shouldReply('cmd2', 'cmd2:123')
       await client4.shouldNotReply('cmd2')
@@ -64,7 +62,7 @@ describe('Runtime', () => {
     })
 
     it('multiple prefixes', async () => {
-      app.config.prefix = ['!', '.']
+      app.koishi.config.prefix = ['!', '.']
 
       await client1.shouldReply('cmd2', 'cmd2:123')
       await client4.shouldNotReply('cmd2')
@@ -75,7 +73,7 @@ describe('Runtime', () => {
     })
 
     it('optional prefix', async () => {
-      app.config.prefix = ['.', '']
+      app.koishi.config.prefix = ['', '.']
 
       await client1.shouldReply('cmd2', 'cmd2:123')
       await client4.shouldReply('cmd2', 'cmd2:123')
@@ -86,7 +84,7 @@ describe('Runtime', () => {
     })
 
     it('no prefix', async () => {
-      app.config.prefix = null
+      app.koishi.config.prefix = null
 
       await client1.shouldReply('cmd2', 'cmd2:123')
       await client4.shouldReply('cmd2', 'cmd2:123')
@@ -99,11 +97,11 @@ describe('Runtime', () => {
 
   describe('Nickname Prefix', () => {
     before(() => {
-      app.config.prefix = ['-']
+      app.koishi.config.prefix = ['-']
     })
 
     after(() => {
-      app.config.prefix = null
+      app.koishi.config.prefix = null
     })
 
     it('no nickname', async () => {
@@ -111,11 +109,16 @@ describe('Runtime', () => {
       await client4.shouldNotReply('cmd2')
       await client1.shouldReply('-cmd2', 'cmd2:123')
       await client4.shouldReply('-cmd2', 'cmd2:123')
-      await client4.shouldNotReply(`<reply id="123"/> <at id="${DEFAULT_SELF_ID}"/> cmd2`)
+      await client4.shouldReply('<at id="514"/> <at id="999"/> cmd2', 'cmd2:123')
+      await client4.shouldReply('<at id="999"/> <at id="514"/> cmd2', 'cmd2:123')
+      await client4.shouldNotReply('<at id="999"/> cmd2')
+      await client4.shouldNotReply(`<quote id="123"/> cmd2`)
+      await client4.shouldNotReply(`<quote id="123"/> <at id="999"/> cmd2`)
+      await client4.shouldReply('<quote id="123"/> <at id="514"/> cmd2', 'cmd2:123')
     })
 
     it('single nickname', async () => {
-      app.config.nickname = ['koishi']
+      app.koishi.config.nickname = ['koishi']
 
       await client1.shouldReply('koishi, cmd2', 'cmd2:123')
       await client4.shouldReply('koishi, cmd2', 'cmd2:123')
@@ -128,7 +131,7 @@ describe('Runtime', () => {
     })
 
     it('multiple nicknames', async () => {
-      app.config.nickname = ['komeiji', 'koishi']
+      app.koishi.config.nickname = ['komeiji', 'koishi']
 
       await client1.shouldReply('cmd2', 'cmd2:123')
       await client4.shouldNotReply('cmd2')
@@ -143,11 +146,11 @@ describe('Runtime', () => {
 
   describe('Shortcuts', () => {
     before(() => {
-      app.config.prefix = ['#']
+      app.koishi.config.prefix = ['#']
     })
 
     after(() => {
-      app.config.prefix = null
+      app.koishi.config.prefix = null
     })
 
     it('single shortcut', async () => {
@@ -200,21 +203,38 @@ describe('Runtime', () => {
   describe('Command Validation', () => {
     it('check authority', async () => {
       app.command('cmd1', { showWarning: true })
-      await client2.shouldReply('cmd1', '权限不足。')
+      await client2.shouldReply('cmd1 test', '权限不足。')
+      await client1.shouldReply('cmd1 test', 'cmd1:test')
       await client1.shouldReply('cmd1 --bar', '权限不足。')
       app.command('cmd1', { showWarning: false })
       await client1.shouldNotReply('cmd1 --bar')
+      const cmd3 = app.command('cmd1/cmd3').action(() => 'after cmd3')
+      await client2.shouldReply('cmd3', '权限不足。')
+      await client1.shouldReply('cmd3', 'after cmd3')
+      cmd3.dispose()
     })
 
     it('check arg count', async () => {
       cmd1.config.checkArgCount = true
       cmd1.config.showWarning = true
-      await client4.shouldReply('cmd1', '缺少参数，输入帮助以查看用法。')
       await client4.shouldReply('cmd1 foo', 'cmd1:foo')
+      await client4.shouldReply('cmd1', '请发送arg1。')
+      await client4.shouldReply('bar baz', 'cmd1:bar baz')
       await client4.shouldReply('cmd1 foo bar', '存在多余参数，输入帮助以查看用法。')
       cmd1.config.showWarning = false
-      await client4.shouldNotReply('cmd1')
       cmd1.config.checkArgCount = false
+    })
+
+    it('check arg count: timeout', async () => {
+      const clock = install()
+      cmd1.config.checkArgCount = true
+      cmd1.config.showWarning = true
+      await client4.shouldReply('cmd1', '请发送arg1。')
+      await clock.runAllAsync()
+      await client4.shouldReply('', '缺少参数，输入帮助以查看用法。')
+      cmd1.config.showWarning = false
+      cmd1.config.checkArgCount = false
+      clock.uninstall()
     })
 
     it('check unknown option', async () => {

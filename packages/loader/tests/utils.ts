@@ -1,25 +1,20 @@
-import { Dict, Logger, Plugin } from 'koishi'
+import { Context, Dict, Plugin } from 'koishi'
 import { Loader } from '../src'
-import * as jest from 'jest-mock'
-
-const logger = new Logger('app')
+import { mock as jest } from 'node:test'
 
 export default class TestLoader extends Loader {
-  data: Dict<Plugin.Object> = Object.create(null)
+  // @ts-ignore
+  data: Dict<Plugin.Object<Context>> = Object.create(null)
 
-  async resolvePlugin(name: string) {
+  async import(name: string) {
     return this.data[name] ||= {
       name,
       apply: (ctx) => {
-        if (name === 'foo') throw new Error()
+        if (name === 'foo') throw new Error('error from plugin')
         ctx.on(`test/${name}` as any, jest.fn())
         ctx.accept()
       },
     }
-  }
-
-  async resolve(name: string) {
-    return name
   }
 
   fullReload() {

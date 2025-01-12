@@ -1,5 +1,6 @@
 import { App, sleep } from 'koishi'
 import mock from '@koishijs/plugin-mock'
+import memory from '@minatojs/driver-memory'
 
 describe('Session API', () => {
   describe('Command Execution', () => {
@@ -53,10 +54,25 @@ describe('Session API', () => {
     })
 
     it('session.prompt 2', async () => {
-      app.config.delay.prompt = 0
+      app.koishi.config.delay.prompt = 0
       await client.shouldReply('prompt', 'prompt text')
       await sleep(0)
       await client.shouldReply('foo', 'received nothing')
     })
+  })
+
+  it('autoAuthorize', async () => {
+    const app = new App({ autoAuthorize: 0 })
+    app.plugin(mock)
+    app.plugin(memory)
+    app.command('foo').action(() => 'foo')
+    app.middleware(async (session, next) => {
+      session.user['name'] = 'bar'
+      return 'bar'
+    })
+    await app.start()
+    const client = app.mock.client('123', '456')
+    await client.shouldReply('foo', '权限不足。')
+    await client.shouldReply('bar', 'bar')
   })
 })

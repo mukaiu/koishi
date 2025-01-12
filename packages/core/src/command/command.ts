@@ -1,11 +1,12 @@
 import { Awaitable, camelize, Dict, isNullable, remove } from 'cosmokit'
 import { coerce } from '@koishijs/utils'
-import { Context, Fragment, Logger, Schema, Session } from '@satorijs/core'
-import { Disposable } from 'cordis'
+import { Fragment, Logger, Schema, Universal } from '@satorijs/core'
 import { Argv } from './parser'
 import { Next, SessionError } from '../middleware'
 import { Channel, User } from '../database'
-import { FieldCollector } from '../session'
+import { FieldCollector, Session } from '../session'
+import { Permissions } from '../permission'
+import { Context } from '../context'
 import { Computed } from '../filter'
 
 const logger = new Logger('command')
@@ -15,6 +16,12 @@ export type Extend<O extends {}, K extends string, T> = {
 }
 
 export namespace Command {
+  export interface Alias {
+    options?: Dict
+    args?: string[]
+    filter?: Computed<boolean>
+  }
+
   export interface Shortcut {
     i18n?: boolean
     name?: string | RegExp
@@ -32,52 +39,34 @@ export namespace Command {
     = string | ((session: Session<U, G>) => Awaitable<string>)
 }
 
-export class Command<U extends User.Field = never, G extends Channel.Field = never, A extends any[] = any[], O extends {} = {}> extends Argv.CommandBase {
-  config: Command.Config
+export class Command<
+  U extends User.Field = never,
+  G extends Channel.Field = never,
+  A extends any[] = any[],
+  O extends {} = {},
+> extends Argv.CommandBase<Command.Config> {
   children: Command[] = []
-  parent: Command = null
 
-  _aliases: string[] = []
+  _parent: Command = null
+  _aliases: Dict<Command.Alias> = Object.create(null)
   _examples: string[] = []
   _usage?: Command.Usage
-  _disposed?: boolean
-  _disposables?: Disposable[] = []
 
-  private _userFields: FieldCollector<'user'>[] = [['locale']]
-  private _channelFields: FieldCollector<'channel'>[] = [['locale']]
+  private _userFields: FieldCollector<'user'>[] = [['locales']]
+  private _channelFields: FieldCollector<'channel'>[] = [['locales']]
   private _actions: Command.Action[] = []
   private _checkers: Command.Action[] = [async (argv) => {
     return this.ctx.serial(argv.session, 'command/before-execute', argv)
   }]
 
-  static defaultConfig: Command.Config = {
-    authority: 1,
-    showWarning: true,
-    handleError: true,
-  }
-
-  static defaultOptionConfig: Argv.OptionConfig = {
-    authority: 0,
-  }
-
-  private static _userFields: FieldCollector<'user'>[] = []
-  private static _channelFields: FieldCollector<'channel'>[] = []
-
-  /** @deprecated use `command-added` event instead */
-  static userFields(fields: FieldCollector<'user'>) {
-    this._userFields.push(fields)
-    return this
-  }
-
-  /** @deprecated use `command-added` event instead */
-  static channelFields(fields: FieldCollector<'channel'>) {
-    this._channelFields.push(fields)
-    return this
-  }
-
-  constructor(name: string, decl: string, ctx: Context) {
-    super(name, decl, ctx)
-    this.config = { ...Command.defaultConfig }
+  constructor(name: string, decl: string, ctx: Context, config: Command.Config) {
+    super(name, decl, ctx, {
+      showWarning: true,
+      handleError: true,
+      slash: true,
+      ...config,
+    })
+    this.config.permissions ??= [`authority:${config?.authority ?? 1}`]
     this._registerAlias(name)
     ctx.$commander._commandList.push(this)
   }
@@ -87,37 +76,52 @@ export class Command<U extends User.Field = never, G extends Channel.Field = nev
   }
 
   get displayName() {
-    return this._aliases[0]
+    return Object.keys(this._aliases)[0]
   }
 
   set displayName(name) {
     this._registerAlias(name, true)
   }
 
-  private _registerAlias(name: string, prepend = false) {
-    name = name.toLowerCase()
+  get parent() {
+    return this._parent
+  }
+
+  set parent(parent: Command) {
+    if (this._parent === parent) return
+    if (this._parent) {
+      remove(this._parent.children, this)
+    }
+    this._parent = parent
+    if (parent) {
+      parent.children.push(this)
+    }
+  }
+
+  static normalize(name: string) {
+    return name.toLowerCase().replace(/_/g, '-')
+  }
+
+  private _registerAlias(name: string, prepend = false, options: Command.Alias = {}) {
+    name = Command.normalize(name)
     if (name.startsWith('.')) name = this.parent.name + name
 
-    // add to list
-    const done = this._aliases.includes(name)
-    if (done) {
-      if (prepend) {
-        remove(this._aliases, name)
-        this._aliases.unshift(name)
-      }
-      return
-    } else if (prepend) {
-      this._aliases.unshift(name)
-    } else {
-      this._aliases.push(name)
+    // check global
+    const previous = this.ctx.$commander.get(name)
+    if (previous && previous !== this) {
+      throw new Error(`duplicate command names: "${name}"`)
     }
 
-    // register global
-    const previous = this.ctx.$commander.get(name)
-    if (!previous) {
-      this.ctx.$commander.set(name, this)
-    } else if (previous !== this) {
-      throw new Error(`duplicate command names: "${name}"`)
+    // add to list
+    const existing = this._aliases[name]
+    if (existing) {
+      if (prepend) {
+        this._aliases = { [name]: existing, ...this._aliases }
+      }
+    } else if (prepend) {
+      this._aliases = { [name]: options, ...this._aliases }
+    } else {
+      this._aliases[name] = options
     }
   }
 
@@ -135,11 +139,17 @@ export class Command<U extends User.Field = never, G extends Channel.Field = nev
     return this as any
   }
 
-  alias(...names: string[]) {
-    if (this._disposed) return this
-    for (const name of names) {
-      this._registerAlias(name)
+  alias(...names: string[]): this
+  alias(name: string, options: Command.Alias): this
+  alias(...args: any[]) {
+    if (typeof args[1] === 'object') {
+      this._registerAlias(args[0], false, args[1])
+    } else {
+      for (const name of args) {
+        this._registerAlias(name)
+      }
     }
+    this.caller.emit('command-updated', this)
     return this
   }
 
@@ -151,10 +161,11 @@ export class Command<U extends User.Field = never, G extends Channel.Field = nev
       .replace(/@@__PLACEHOLDER__@@/g, '$')
   }
 
+  /** @deprecated please use `cmd.alias()` instead */
   shortcut(pattern: string | RegExp, config?: Command.Shortcut & { i18n?: false }): this
+  /** @deprecated please use `cmd.alias()` instead */
   shortcut(pattern: string, config: Command.Shortcut & { i18n: true }): this
   shortcut(pattern: string | RegExp, config: Command.Shortcut = {}) {
-    if (this._disposed) return this
     let content = this.displayName
     for (const key in config.options || {}) {
       content += ` --${camelize(key)}`
@@ -194,7 +205,6 @@ export class Command<U extends User.Field = never, G extends Channel.Field = nev
     def = this.name + (def.charCodeAt(0) === 46 ? '' : '/') + def
     const desc = typeof args[0] === 'string' ? args.shift() as string : ''
     const config = args[0] as Command.Config || {}
-    if (this._disposed) config.patch = true
     return this.ctx.command(def, desc, config)
   }
 
@@ -217,21 +227,16 @@ export class Command<U extends User.Field = never, G extends Channel.Field = nev
     if (typeof args[0] === 'string') {
       desc = args.shift() as string
     }
-    const config = args[0] as Argv.OptionConfig
-    this._createOption(name, desc, config || {})
-    this.caller.collect('command.option', () => this.removeOption(name))
+    const config = { ...args[0] as Argv.OptionConfig }
+    config.permissions ??= [`authority:${config.authority ?? 0}`]
+    this._createOption(name, desc, config)
+    this.caller.emit('command-updated', this)
+    this.caller.collect('option', () => this.removeOption(name))
     return this
   }
 
   match(session: Session) {
-    const { authority = Infinity } = (session.user || {}) as User
-    return this.ctx.filter(session) && session.resolve(this.config.authority) <= authority
-  }
-
-  /** @deprecated */
-  getConfig<K extends keyof Command.Config>(key: K, session: Session): Exclude<Command.Config[K], (session: Session) => any> {
-    const value = this.config[key] as any
-    return typeof value === 'function' ? value(session) : value
+    return this.ctx.filter(session)
   }
 
   check(callback: Command.Action<U, G, A, O>, append = false) {
@@ -258,6 +263,7 @@ export class Command<U extends User.Field = never, G extends Channel.Field = nev
     return this
   }
 
+  /** @deprecated */
   use<T extends Command, R extends any[]>(callback: (command: this, ...args: R) => T, ...args: R): T {
     return callback(this, ...args)
   }
@@ -274,7 +280,7 @@ export class Command<U extends User.Field = never, G extends Channel.Field = nev
     // before hooks
     for (const validator of this._checkers) {
       const result = await validator.call(this, argv, ...args)
-      if (typeof result === 'string') return result
+      if (!isNullable(result)) return result
     }
 
     // FIXME empty actions will cause infinite loop
@@ -320,26 +326,45 @@ export class Command<U extends User.Field = never, G extends Channel.Field = nev
   }
 
   dispose() {
-    this._disposed = true
     this._disposables.splice(0).forEach(dispose => dispose())
     this.ctx.emit('command-removed', this)
     for (const cmd of this.children.slice()) {
       cmd.dispose()
     }
-    for (const name of this._aliases) {
-      this.ctx.$commander.delete(name)
-    }
     remove(this.ctx.$commander._commandList, this)
-    if (this.parent) {
-      remove(this.parent.children, this)
+    this.parent = null
+  }
+
+  toJSON(): Universal.Command {
+    return {
+      name: this.name,
+      description: this.ctx.i18n.get(`commands.${this.name}.description`),
+      arguments: this._arguments.map(arg => ({
+        name: arg.name,
+        type: toStringType(arg.type),
+        description: this.ctx.i18n.get(`commands.${this.name}.arguments.${arg.name}`),
+        required: arg.required,
+      })),
+      options: Object.entries(this._options).map(([name, option]) => ({
+        name,
+        type: toStringType(option.type),
+        description: this.ctx.i18n.get(`commands.${this.name}.options.${name}`),
+        required: option.required,
+      })),
+      children: this.children
+        .filter(child => child.name.includes('.'))
+        .map(child => child.toJSON()),
     }
   }
 }
 
+function toStringType(type: Argv.Type) {
+  return typeof type === 'string' ? type : 'string'
+}
+
 export namespace Command {
-  export interface Config {
-    /** min authority */
-    authority?: Computed<number>
+  export interface Config extends Argv.CommandBase.Config, Permissions.Config {
+    captureQuote?: boolean
     /** disallow unknown options */
     checkUnknown?: boolean
     /** check argument count */
@@ -348,12 +373,15 @@ export namespace Command {
     showWarning?: boolean
     /** handle error */
     handleError?: boolean | ((error: Error, argv: Argv) => Awaitable<void | Fragment>)
-    /** depend on existing commands */
-    patch?: boolean
+    /** enable slash command */
+    slash?: boolean
   }
 
   export const Config: Schema<Config> = Schema.object({
-    authority: Schema.computed(Schema.natural()).description('指令的权限等级。').default(1),
+    permissions: Schema.array(String).role('perms').default(['authority:1']).description('权限继承。'),
+    dependencies: Schema.array(String).role('perms').description('权限依赖。'),
+    slash: Schema.boolean().description('启用斜线指令功能。').default(true),
+    captureQuote: Schema.boolean().description('是否捕获引用文本。').default(true).hidden(),
     checkUnknown: Schema.boolean().description('是否检查未知选项。').default(false).hidden(),
     checkArgCount: Schema.boolean().description('是否检查参数数量。').default(false).hidden(),
     showWarning: Schema.boolean().description('是否显示警告。').default(true).hidden(),

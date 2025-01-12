@@ -1,23 +1,46 @@
-import { Random } from '@koishijs/utils'
 import { distance } from 'fastest-levenshtein'
 import { Dict, isNullable } from 'cosmokit'
-import { Context, h, Logger } from '@satorijs/core'
+import { fallback, LocaleTree } from '@koishijs/i18n-utils'
+import { h, Logger, Schema } from '@satorijs/core'
+import { Context } from './context'
 import zhCN from './locales/zh-CN.yml'
 import enUS from './locales/en-US.yml'
-import jaJP from './locales/ja-JP.yml'
-import frFR from './locales/fr-FR.yml'
-import zhTW from './locales/zh-TW.yml'
 
 const logger = new Logger('i18n')
 const kTemplate = Symbol('template')
 
-declare module '@satorijs/core' {
+declare module './context' {
   interface Context {
     i18n: I18n
   }
 
   interface Events {
     'internal/i18n'(): void
+  }
+}
+
+type GroupNames<P extends string, K extends string = never> =
+  | P extends `${string}(${infer R})${infer S}`
+  ? GroupNames<S, K | R>
+  : K
+
+export type MatchResult<P extends string = never> = Record<GroupNames<P>, string>
+
+export function createMatch<P extends string>(pattern: P): (string: string) => undefined | MatchResult<P> {
+  const groups: string[] = []
+  const source = pattern.replace(/\(([^)]+)\)/g, (_, name) => {
+    groups.push(name)
+    return '(.+)'
+  })
+  const regexp = new RegExp(`^${source}$`)
+  return (string: string) => {
+    const capture = regexp.exec(string)
+    if (!capture) return
+    const data: any = {}
+    for (let i = 0; i < groups.length; i++) {
+      data[groups[i]] = capture[i + 1]
+    }
+    return data
   }
 }
 
@@ -38,25 +61,29 @@ export namespace I18n {
 
   export interface FindOptions extends CompareOptions {}
 
-  export interface FindResult {
+  export interface FindResult<P extends string> {
     locale: string
-    data: Dict
+    data: MatchResult<P>
     similarity: number
   }
 }
 
 export class I18n {
-  _data: Dict<I18n.Store> = {}
+  _data: Dict<Dict<string>> = {}
   _presets: Dict<I18n.Renderer> = {}
 
-  constructor(public ctx: Context) {
+  locales: LocaleTree
+
+  constructor(public ctx: Context, config: I18n.Config) {
+    this.locales = LocaleTree.from(config.locales)
+
     this.define('', { '': '' })
-    this.define('zh', zhCN)
-    this.define('en', enUS)
-    this.define('ja', jaJP)
-    this.define('fr', frFR)
-    this.define('zh-TW', zhTW)
-    this.registerBuiltins()
+    this.define('zh-CN', zhCN)
+    this.define('en-US', enUS)
+  }
+
+  fallback(locales: string[]) {
+    return fallback(this.locales, locales)
   }
 
   compare(expect: string, actual: string, options: CompareOptions = {}) {
@@ -65,35 +92,45 @@ export class I18n {
     return value >= threshold ? value : 0
   }
 
+  get(key: string, locales: string[] = []): Dict<string> {
+    const result: Dict<string> = {}
+    for (const locale of this.fallback(locales)) {
+      const value = this._data[locale]?.[key]
+      if (value) result[locale] = value
+    }
+    return result
+  }
+
   private* set(locale: string, prefix: string, value: I18n.Node): Generator<string> {
-    if (prefix.includes('@') || typeof value === 'string') {
-      const dict = this._data[locale]
-      const [path, preset] = prefix.slice(0, -1).split('@')
-      if (preset) {
-        value[kTemplate] = preset
-        logger.warn('preset is deprecated and will be removed in the future')
+    if (typeof value === 'object' && value && !prefix.includes('@')) {
+      for (const key in value) {
+        if (key.startsWith('_')) continue
+        yield* this.set(locale, prefix + key + '.', value[key])
       }
+    } else if (prefix.includes('@')) {
+      throw new Error('preset is deprecated')
+    } else if (typeof value === 'string') {
+      const dict = this._data[locale]
+      const path = prefix.slice(0, -1)
       if (!isNullable(dict[path]) && !locale.startsWith('$') && dict[path] !== value) {
         logger.warn('override', locale, path)
       }
       dict[path] = value
       yield path
     } else {
-      for (const key in value) {
-        yield* this.set(locale, prefix + key + '.', value[key])
-      }
+      delete this._data[locale][prefix.slice(0, -1)]
     }
   }
 
-  define(locale: string, dict: I18n.Store): void
-  define(locale: string, key: string, value: I18n.Node): void
+  define(locale: string, dict: I18n.Store): () => void
+  define(locale: string, key: string, value: I18n.Node): () => void
   define(locale: string, ...args: [I18n.Store] | [string, I18n.Node]) {
     const dict = this._data[locale] ||= {}
     const paths = [...typeof args[0] === 'string'
       ? this.set(locale, args[0] + '.', args[1])
       : this.set(locale, '', args[0])]
     this.ctx.emit('internal/i18n')
-    this[Context.current]?.on('dispose', () => {
+    return this.ctx.collect('i18n', () => {
       for (const path of paths) {
         delete dict[path]
       }
@@ -101,103 +138,74 @@ export class I18n {
     })
   }
 
-  /** @deprecated */
-  formatter(name: string, callback: I18n.Formatter) {
-    logger.warn('formatter is deprecated and will be removed in the future')
-  }
-
-  /** @deprecated */
-  preset(name: string, callback: I18n.Renderer) {
-    this._presets[name] = callback
-  }
-
-  find(path: string, actual: string, options: I18n.FindOptions = {}): I18n.FindResult[] {
+  find<P extends string>(pattern: P, actual: string, options: I18n.FindOptions = {}): I18n.FindResult<P>[] {
     if (!actual) return []
-    const groups: string[] = []
-    path = path.replace(/\(([^)]+)\)/g, (_, name) => {
-      groups.push(name)
-      return '([^.]+)'
-    })
-    const pattern = new RegExp(`^${path}$`)
-    const results: I18n.FindResult[] = []
+    const match = createMatch(pattern)
+    const results: I18n.FindResult<P>[] = []
     for (const locale in this._data) {
       for (const path in this._data[locale]) {
-        const capture = pattern.exec(path)
-        if (!capture) continue
+        const data = match(path)
+        if (!data) continue
         const expect = this._data[locale][path]
         if (typeof expect !== 'string') continue
         const similarity = this.compare(expect, actual, options)
         if (!similarity) continue
-        const data = {}
-        for (let i = 0; i < groups.length; i++) {
-          data[groups[i]] = capture[i + 1]
-        }
         results.push({ locale, data, similarity })
       }
     }
     return results
   }
 
-  render(value: I18n.Node, params: any, locale: string) {
+  _render(value: I18n.Node, params: any, locale: string) {
     if (value === undefined) return
 
     if (typeof value !== 'string') {
       const preset = value[kTemplate]
       const render = this._presets[preset]
       if (!render) throw new Error(`Preset "${preset}" not found`)
-      return render(value, params, locale)
+      return [h.text(render(value, params, locale))]
     }
 
-    return h.parse(value, params).join('')
+    return h.parse(value, params)
   }
 
-  text(locales: Iterable<string>, paths: string[], params: object) {
-    // sort locales by priority
-    const queue = new Set<string>()
-    for (const locale of locales) {
-      if (!locale) continue
-      queue.add(locale)
-    }
-    for (const locale in this._data) {
-      if (locale.startsWith('$')) continue
-      queue.add(locale)
-    }
+  /** @deprecated */
+  text(locales: string[], paths: string[], params: object) {
+    return this.render(locales, paths, params).join('')
+  }
+
+  render(locales: string[], paths: string[], params: object) {
+    locales = this.fallback(locales)
 
     // try every locale
     for (const path of paths) {
-      for (const locale of queue) {
+      for (const locale of locales) {
         for (const key of ['$' + locale, locale]) {
           const value = this._data[key]?.[path]
-          if (value === undefined) continue
-          return this.render(value, params, locale)
+          if (value === undefined || !value && !locale && path !== '') continue
+          return this._render(value, params, locale)
         }
       }
     }
 
     // path not found
     logger.warn('missing', paths[0])
-    return paths[0]
-  }
-
-  private registerBuiltins() {
-    this.preset('plural', (data: string[], params: { length: number }, locale) => {
-      const path = params.length in data ? params.length : data.length - 1
-      return this.render(data[path], params, locale)
-    })
-
-    this.preset('random', (data: string[], params, locale) => {
-      return this.render(Random.pick(data), params, locale)
-    })
-
-    this.preset('list', (data, params: any[], locale) => {
-      const list = Object.entries(params).map(([key, value]) => {
-        return this.render(data.item, { key, value }, locale)
-      })
-      list.unshift(this.render(data.header, params, locale))
-      list.push(this.render(data.footer, params, locale))
-      return list.join('\n').trim()
-    })
+    return [h.text(paths[0])]
   }
 }
 
-Context.service('i18n', I18n)
+export namespace I18n {
+  export interface Config {
+    locales?: string[]
+    output?: 'prefer-user' | 'prefer-channel'
+    match?: 'strict' | 'prefer-input' | 'prefer-output'
+  }
+
+  export const Config: Schema<Config> = Schema.object({
+    locales: Schema.array(String).role('table').default(['zh-CN', 'en-US', 'fr-FR', 'ja-JP', 'de-DE', 'ru-RU']).description('可用的语言列表。按照回退顺序排列。'),
+    output: Schema.union([
+      Schema.const('prefer-user').description('优先使用用户语言'),
+      Schema.const('prefer-channel').description('优先使用频道语言'),
+    ]).default('prefer-channel').description('输出语言偏好设置。'),
+  }).description('国际化设置')
+}

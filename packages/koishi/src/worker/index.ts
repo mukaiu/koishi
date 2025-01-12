@@ -2,17 +2,10 @@ import { Context, Dict, Logger, Schema, Time } from '@koishijs/core'
 import Loader from '@koishijs/loader'
 import * as daemon from './daemon'
 import * as logger from './logger'
-import '@satorijs/satori'
+
+export * from 'koishi'
 
 declare module '@koishijs/core' {
-  interface Events {
-    'exit'(signal: NodeJS.Signals): Promise<void>
-  }
-
-  interface Context {
-    prologue: string[]
-  }
-
   namespace Context {
     interface Config {
       plugins?: Dict
@@ -41,19 +34,10 @@ process.on('unhandledRejection', (error) => {
   new Logger('app').warn(error)
 })
 
-namespace addons {
-  export const name = 'CLI'
-
-  export function apply(ctx: Context, config: Context.Config) {
-    logger.apply(ctx.root)
-    ctx.plugin(daemon, config.daemon)
-  }
-}
-
 async function start() {
   const loader = new Loader()
   await loader.init(process.env.KOISHI_CONFIG_FILE)
-  const config = await loader.readConfig()
+  const config = await loader.readConfig(true)
   logger.prepare(config.logger)
 
   if (config.timezoneOffset !== undefined) {
@@ -65,7 +49,7 @@ async function start() {
   }
 
   const app = await loader.createApp()
-  app.plugin(addons, app.config)
+  app.plugin(daemon, config.daemon)
   await app.start()
 }
 

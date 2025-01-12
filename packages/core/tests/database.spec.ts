@@ -1,7 +1,7 @@
 import { App } from 'koishi'
 import { expect, use } from 'chai'
 import mock from '@koishijs/plugin-mock'
-import memory from '@koishijs/plugin-database-memory'
+import memory from '@minatojs/driver-memory'
 import shape from 'chai-shape'
 import promise from 'chai-as-promised'
 
@@ -19,7 +19,7 @@ after(() => app.stop())
 describe('Database API', () => {
   describe('User Operations', () => {
     it('db.setUser() on non-existing user', async () => {
-      await app.database.setUser('mock', 'A', { authority: 1 })
+      await expect(app.database.setUser('mock', 'A', { authority: 1 })).to.be.rejected
       await expect(app.database.getUser('mock', 'A')).eventually.not.to.be.ok
     })
 

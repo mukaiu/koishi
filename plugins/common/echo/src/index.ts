@@ -13,8 +13,8 @@ export interface Config {}
 export const name = 'echo'
 export const Config: Schema<Config> = Schema.object({})
 
-export function apply(ctx: Context) {
-  ctx.i18n.define('zh', zhCN)
+export function apply(ctx: Context, config: Config) {
+  ctx.i18n.define('zh-CN', zhCN)
 
   ctx.command('echo <message:text>')
     .option('escape', '-e', { authority: 3 })
@@ -25,11 +25,12 @@ export function apply(ctx: Context) {
     .action(async ({ options, session }, message) => {
       if (!message) return session.text('.expect-text')
 
+      // use Array to prevent unescape
+      let content: any = [message]
       if (options.unescape) {
-        message = h.unescape(message)
-      }
-      if (options.escape) {
-        message = h.escape(message)
+        content = h.parse(message)
+      } else if (options.escape) {
+        content = [h.escape(message)]
       }
 
       const target = options.user || options.channel
@@ -39,13 +40,13 @@ export function apply(ctx: Context) {
         if (!bot) {
           return session.text('.platform-not-found')
         } else if (options.user) {
-          await bot.sendPrivateMessage(id, message)
+          await bot.sendPrivateMessage(id, content, session.guildId)
         } else {
-          await bot.sendMessage(id, message, options.guild)
+          await bot.sendMessage(id, content, options.guild)
         }
         return
       }
 
-      return message
+      return content
     })
 }

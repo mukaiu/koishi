@@ -1,29 +1,52 @@
 import * as utils from '@koishijs/utils'
-import { defineProperty, Dict, MaybeArray } from 'cosmokit'
-import { Database, Driver, Update } from '@minatojs/core'
-import { Context, Fragment, Schema } from '@satorijs/core'
-import { Plugin } from './context'
+import { Dict, MaybeArray } from 'cosmokit'
+import { Driver, FlatKeys, FlatPick, Update } from 'minato'
+import * as minato from 'minato'
+import { Fragment, Universal } from '@satorijs/core'
+import { Context } from './context'
 
-declare module '@satorijs/core' {
-  interface Events {
-    'model'(name: keyof Tables): void
-  }
-
+declare module './context' {
   interface Context {
-    database: DatabaseService
-    model: DatabaseService
-    getSelfIds(type?: string, assignees?: string[]): Dict<string[]>
+    [minato.Types]: Types
+    [minato.Tables]: Tables
+    [Context.Database]: Context.Database<this>
     broadcast(content: Fragment, forced?: boolean): Promise<string[]>
     broadcast(channels: readonly string[], content: Fragment, forced?: boolean): Promise<string[]>
   }
+
+  namespace Context {
+    // https://github.com/typescript-eslint/typescript-eslint/issues/6720
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    interface Database<C extends Context = Context> {
+      getUser<K extends FlatKeys<User>>(platform: string, pid: string, modifier?: Driver.Cursor<K>): Promise<FlatPick<User, K>>
+      setUser(platform: string, pid: string, data: Update<User>): Promise<void>
+      createUser(platform: string, pid: string, data: Partial<User>): Promise<User>
+      getChannel<K extends FlatKeys<Channel>>(platform: string, id: string, modifier?: Driver.Cursor<K>): Promise<FlatPick<Channel, K | 'id' | 'platform'>>
+      getChannel<K extends FlatKeys<Channel>>(platform: string, ids: string[], modifier?: Driver.Cursor<K>): Promise<FlatPick<Channel, K>[]>
+      getAssignedChannels<K extends Channel.Field>(fields?: K[], selfIdMap?: Dict<string[]>): Promise<Pick<Channel, K>[]>
+      setChannel(platform: string, id: string, data: Update<Channel>): Promise<void>
+      createChannel(platform: string, id: string, data: Partial<Channel>): Promise<Channel>
+    }
+  }
+}
+
+export interface Types extends minato.Types {}
+
+export interface Tables extends minato.Tables {
+  user: User
+  binding: Binding
+  channel: Channel
 }
 
 export interface User {
   id: number
+  name: string
+  /** @deprecated */
   flag: number
   authority: number
-  name: string
-  locale: string
+  locales: string[]
+  permissions: string[]
+  createdAt: Date
 }
 
 export namespace User {
@@ -32,7 +55,6 @@ export namespace User {
   }
 
   export type Field = keyof User
-  export const fields: Field[] = []
   export type Observed<K extends Field = Field> = utils.Observed<Pick<User, K>, Promise<void>>
 }
 
@@ -46,10 +68,13 @@ export interface Binding {
 export interface Channel {
   id: string
   platform: string
+  /** @deprecated */
   flag: number
   assignee: string
   guildId: string
-  locale: string
+  locales: string[]
+  permissions: string[]
+  createdAt: Date
 }
 
 export namespace Channel {
@@ -59,58 +84,65 @@ export namespace Channel {
   }
 
   export type Field = keyof Channel
-  export const fields: Field[] = []
   export type Observed<K extends Field = Field> = utils.Observed<Pick<Channel, K>, Promise<void>>
 }
 
-export interface Tables {
-  user: User
-  binding: Binding
-  channel: Channel
-}
+interface KoishiDatabase extends minato.Database<Tables, Types, Context> {}
 
-export class DatabaseService extends Database<Tables> {
-  static readonly methods = ['getSelfIds', 'broadcast']
+class KoishiDatabase {
+  constructor(public ctx: Context) {
+    ctx.mixin(this, {
+      getUser: 'database.getUser',
+      setUser: 'database.setUser',
+      createUser: 'database.createUser',
+      getChannel: 'database.getChannel',
+      getAssignedChannels: 'database.getAssignedChannels',
+      setChannel: 'database.setChannel',
+      createChannel: 'database.createChannel',
+      broadcast: 'database.broadcast',
+    })
 
-  constructor(protected app: Context) {
-    super()
-    defineProperty(this, Context.current, app)
+    ctx.mixin('database', ['broadcast'] as never[])
 
-    this.extend('user', {
-      id: 'unsigned(20)',
-      name: { type: 'string', length: 63 },
-      flag: 'unsigned(20)',
+    ctx.model.extend('user', {
+      id: 'unsigned(8)',
+      name: { type: 'string', length: 255 },
+      flag: 'unsigned(8)',
       authority: 'unsigned(4)',
-      locale: 'string(63)',
+      locales: 'list(255)',
+      permissions: 'list',
+      createdAt: 'timestamp',
     }, {
       autoInc: true,
     })
 
-    this.extend('binding', {
-      aid: 'unsigned(20)',
-      bid: 'unsigned(20)',
-      pid: 'string(63)',
-      platform: 'string(63)',
+    ctx.model.extend('binding', {
+      aid: 'unsigned(8)',
+      bid: 'unsigned(8)',
+      pid: 'string(255)',
+      platform: 'string(255)',
     }, {
       primary: ['pid', 'platform'],
     })
 
-    this.extend('channel', {
-      id: 'string(63)',
-      platform: 'string(63)',
-      flag: 'unsigned(20)',
-      assignee: 'string(63)',
-      guildId: 'string(63)',
-      locale: 'string(63)',
+    ctx.model.extend('channel', {
+      id: 'string(255)',
+      platform: 'string(255)',
+      flag: 'unsigned(8)',
+      assignee: 'string(255)',
+      guildId: 'string(255)',
+      locales: 'list(255)',
+      permissions: 'list',
+      createdAt: 'timestamp',
     }, {
       primary: ['id', 'platform'],
     })
 
-    app.on('bot-added', ({ platform }) => {
-      if (platform in this.tables.user.fields) return
-      this.migrate('user', { [platform]: 'string(63)' }, async (db) => {
+    ctx.on('login-added', ({ platform }) => {
+      if (platform in ctx.model.tables.user.fields) return
+      ctx.model.migrate('user', { [platform]: 'string(255)' }, async (db) => {
         const users = await db.get('user', { [platform]: { $exists: true } }, ['id', platform as never])
-        await db.upsert('binding', users.map((user) => ({
+        await db.upsert('binding', users.filter(u => u[platform]).map((user) => ({
           aid: user.id,
           bid: user.id,
           pid: user[platform],
@@ -120,7 +152,7 @@ export class DatabaseService extends Database<Tables> {
     })
   }
 
-  async getUser<K extends User.Field>(platform: string, pid: string, modifier?: Driver.Cursor<K>): Promise<Pick<User, K>> {
+  async getUser<K extends FlatKeys<User>>(platform: string, pid: string, modifier?: Driver.Cursor<K>): Promise<FlatPick<User, K>> {
     const [binding] = await this.get('binding', { platform, pid }, ['aid'])
     if (!binding) return
     const [user] = await this.get('user', { id: binding.aid }, modifier)
@@ -129,7 +161,7 @@ export class DatabaseService extends Database<Tables> {
 
   async setUser(platform: string, pid: string, data: Update<User>) {
     const [binding] = await this.get('binding', { platform, pid }, ['aid'])
-    if (!binding) return
+    if (!binding) throw new Error('user not found')
     return this.set('user', binding.aid, data)
   }
 
@@ -139,31 +171,28 @@ export class DatabaseService extends Database<Tables> {
     return user
   }
 
-  getChannel<K extends Channel.Field>(platform: string, id: string, modifier?: Driver.Cursor<K>): Promise<Pick<Channel, K | 'id' | 'platform'>>
-  getChannel<K extends Channel.Field>(platform: string, ids: string[], modifier?: Driver.Cursor<K>): Promise<Pick<Channel, K>[]>
-  async getChannel(platform: string, id: MaybeArray<string>, modifier?: Driver.Cursor<Channel.Field>) {
+  getChannel<K extends FlatKeys<Channel>>(platform: string, id: string, modifier?: Driver.Cursor<K>): Promise<FlatPick<Channel, K | 'id' | 'platform'>>
+  getChannel<K extends FlatKeys<Channel>>(platform: string, ids: string[], modifier?: Driver.Cursor<K>): Promise<FlatPick<Channel, K>[]>
+  async getChannel(platform: string, id: MaybeArray<string>, modifier?: any) {
     const data = await this.get('channel', { platform, id }, modifier)
     if (Array.isArray(id)) return data
     if (data[0]) Object.assign(data[0], { platform, id })
     return data[0]
   }
 
-  getSelfIds(type?: string, assignees?: string[]): Dict<string[]> {
-    if (type) {
-      assignees ||= this.app.bots.filter(bot => bot.platform === type).map(bot => bot.selfId)
-      return { [type]: assignees }
+  getSelfIds(platforms?: string[]): Dict<string[]> {
+    const selfIdMap: Dict<string[]> = Object.create(null)
+    for (const bot of this.ctx.bots) {
+      if (platforms && !platforms.includes(bot.platform)) continue
+      (selfIdMap[bot.platform] ||= []).push(bot.selfId)
     }
-    const platforms: Dict<string[]> = {}
-    for (const bot of this.app.bots) {
-      (platforms[bot.platform] ||= []).push(bot.selfId)
-    }
-    return platforms
+    return selfIdMap
   }
 
-  getAssignedChannels<K extends Channel.Field>(fields?: K[], assignMap?: Dict<string[]>): Promise<Pick<Channel, K>[]>
-  async getAssignedChannels(fields?: Channel.Field[], assignMap: Dict<string[]> = this.getSelfIds()) {
+  getAssignedChannels<K extends Channel.Field>(fields?: K[], selfIdMap?: Dict<string[]>): Promise<Pick<Channel, K>[]>
+  async getAssignedChannels(fields?: Channel.Field[], selfIdMap: Dict<string[]> = this.getSelfIds()) {
     return this.get('channel', {
-      $or: Object.entries(assignMap).map(([platform, assignee]) => ({ platform, assignee })),
+      $or: Object.entries(selfIdMap).map(([platform, assignee]) => ({ platform, assignee })),
     }, fields)
   }
 
@@ -176,70 +205,47 @@ export class DatabaseService extends Database<Tables> {
   }
 
   async broadcast(...args: [Fragment, boolean?] | [readonly string[], Fragment, boolean?]) {
-    let channels: string[]
-    if (Array.isArray(args[0])) channels = args.shift() as any
+    let channels: string[], platforms: string[]
+    if (Array.isArray(args[0])) {
+      channels = args.shift() as any
+      platforms = channels.map(c => c.split(':')[0])
+    }
     const [content, forced] = args as [Fragment, boolean]
     if (!content) return []
 
-    const data = await this.getAssignedChannels(['id', 'assignee', 'flag', 'platform', 'guildId', 'locale'])
-    const assignMap: Dict<Dict<Pick<Channel, 'id' | 'guildId' | 'locale'>[]>> = {}
+    const selfIdMap = this.getSelfIds(platforms)
+    const data = await this.getAssignedChannels(['id', 'assignee', 'flag', 'platform', 'guildId', 'locales'], selfIdMap)
+    const assignMap: Dict<Dict<Pick<Channel, 'id' | 'guildId' | 'locales'>[]>> = {}
     for (const channel of data) {
       const { platform, id, assignee, flag } = channel
-      if (channels && !channels.includes(`${platform}:${id}`)) continue
+      if (channels) {
+        const index = channels?.indexOf(`${platform}:${id}`)
+        if (index < 0) continue
+        channels.splice(index, 1)
+      }
       if (!forced && (flag & Channel.Flag.silent)) continue
       ((assignMap[platform] ||= {})[assignee] ||= []).push(channel)
     }
 
-    return (await Promise.all(this.app.bots.map((bot) => {
+    if (channels?.length) {
+      this.ctx.logger('app').warn('broadcast', 'channel not found: ', channels.join(', '))
+    }
+
+    return (await Promise.all(this.ctx.bots.map((bot) => {
       const targets = assignMap[bot.platform]?.[bot.selfId]
       if (!targets) return Promise.resolve([])
-      const sessions = targets.map(({ id, guildId, locale }) => bot.session({
-        type: 'message',
-        subtype: 'group',
-        channelId: id,
-        guildId,
-        locale,
-      }))
+      const sessions = targets.map(({ id, guildId, locales }) => {
+        const session = bot.session({
+          type: 'message',
+          channel: { id, type: Universal.Channel.Type.TEXT },
+          guild: { id: guildId },
+        })
+        session.locales = locales
+        return session
+      })
       return bot.broadcast(sessions, content)
     }))).flat(1)
   }
 }
 
-// workaround typings
-DatabaseService.prototype.extend = function extend(this: DatabaseService, name, fields, config) {
-  Database.prototype.extend.call(this, name, fields, {
-    ...config,
-    // driver: this[Context.current].mapping.database,
-  })
-  this.app.emit('model', name)
-}
-
-Context.service('database')
-Context.service('model', DatabaseService)
-
-export const defineDriver = <T>(constructor: Driver.Constructor<T>, schema?: Schema, prepare?: Plugin.Function<T>): Plugin.Object<T> => ({
-  name: constructor.name,
-  reusable: true,
-  Config: schema,
-  filter: false,
-  apply(ctx, config) {
-    config = { ...config }
-    prepare?.(ctx, config)
-    const driver = new constructor(ctx.model, config)
-    const key = ctx.mapping.database || 'default'
-
-    ctx.on('ready', async () => {
-      await driver.start()
-      ctx.model.drivers[key] = driver
-      ctx.model.refresh()
-      const database = Object.create(ctx.model)
-      ctx.database = database
-    })
-
-    ctx.on('dispose', async () => {
-      ctx.database = null
-      delete ctx.model.drivers[key]
-      await driver.stop()
-    })
-  },
-})
+export default KoishiDatabase

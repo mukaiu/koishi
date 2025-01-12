@@ -1,7 +1,7 @@
 import { App } from 'koishi'
 import * as help from '@koishijs/plugin-help'
 import mock from '@koishijs/plugin-mock'
-import memory from '@koishijs/plugin-database-memory'
+import memory from '@minatojs/driver-memory'
 
 const app = new App({
   minSimilarity: 0.64,
@@ -11,7 +11,7 @@ app.plugin(mock)
 app.plugin(help)
 app.plugin(memory)
 
-app.i18n.define('$zh', 'commands.help.messages.global-epilog', 'EPILOG')
+app.i18n.define('$zh-CN', 'commands.help.messages.global-epilog', 'EPILOG')
 
 const client = app.mock.client('123', '456')
 
@@ -38,12 +38,11 @@ describe('@koishijs/plugin-help', () => {
       '指令：help [command]',
       '显示帮助信息',
       '可用的选项有：',
-      '    -a, --authority  显示权限设置',
       '    -H, --show-hidden  查看隐藏的选项和指令',
     ].join('\n'))
 
     await client.shouldReply('help xxxx', '指令未找到。')
-    await client.shouldReply('help heip', '指令未找到。您要找的是不是“help”？发送句号以使用推测的指令。')
+    await client.shouldReply('help heip', '指令未找到。您要找的是不是“help”？回复句号以使用推测的指令。')
     await client.shouldReply('.', message)
     await client.shouldReply('help -h', message)
     await client.shouldReply('help 帮助', message)
@@ -51,18 +50,18 @@ describe('@koishijs/plugin-help', () => {
 
   it('command attributes', async () => {
     app.command('foo1', 'DESCRIPTION').alias('foo')
-    app.command('foo2', 'DESCRIPTION', { authority: 2 })
     app.command('foo3', 'DESCRIPTION').shortcut(/foobar/)
     app.command('foo4', 'DESCRIPTION').usage('USAGE TEXT')
     app.command('foo5', 'DESCRIPTION').usage(({ userId }) => '' + userId)
     app.command('foo6', 'DESCRIPTION').example('EXAMPLE TEXT')
+    app.command('foo7', 'DESCRIPTION', { authority: 3 })
 
     await client.shouldReply('help foo1', '指令：foo1\nDESCRIPTION\n别名：foo。')
-    await client.shouldReply('help foo2', '指令：foo2\nDESCRIPTION\n最低权限：2 级。')
     await client.shouldReply('help foobar', '指令：foo3\nDESCRIPTION')
     await client.shouldReply('help foo4', '指令：foo4\nDESCRIPTION\nUSAGE TEXT')
     await client.shouldReply('help foo5', '指令：foo5\nDESCRIPTION\n123')
     await client.shouldReply('help foo6', '指令：foo6\nDESCRIPTION\n使用示例：\n    EXAMPLE TEXT')
+    await client.shouldReply('help foo7', '权限不足。')
   })
 
   it('command options', async () => {
@@ -94,18 +93,10 @@ describe('@koishijs/plugin-help', () => {
       '    --opt2 [arg]  选项3',
       '    -o, --opt3 [arg]',
     ].join('\n'))
-
-    await client.shouldReply('help bar -a', [
-      message,
-      '可用的选项有（括号内为额外要求的权限等级）：',
-      '    (2) --opt1  选项1',
-      '    (2) -n  选项2',
-      '    --opt2 [arg]  选项3',
-    ].join('\n'))
   })
 
   it('subcommand', async () => {
-    const foo2 = app.command('foo2', { authority: 0 })
+    const foo2 = app.command('foo2', 'DESCRIPTION', { authority: 0 })
     const foo1 = foo2.subcommand('foo1')
     const foo3 = foo1.subcommand('foo3')
 
@@ -116,19 +107,12 @@ describe('@koishijs/plugin-help', () => {
       '    foo1  DESCRIPTION',
     ].join('\n'))
 
-    await client.shouldReply('help foo2 -a', [
-      '指令：foo2',
-      'DESCRIPTION',
-      '可用的子指令有（括号内为对应的最低权限等级，标有星号的表示含有子指令）：',
-      '    foo1 (1*)  DESCRIPTION',
-    ].join('\n'))
-
-    await client.shouldReply('help foo1 -a', [
+    await client.shouldReply('help foo1', [
       '指令：foo1',
       'DESCRIPTION',
       '别名：foo。',
-      '可用的子指令有（括号内为对应的最低权限等级）：',
-      '    foo3 (1)  DESCRIPTION',
+      '可用的子指令有：',
+      '    foo3  DESCRIPTION',
     ].join('\n'))
   })
 
@@ -136,7 +120,7 @@ describe('@koishijs/plugin-help', () => {
     const app = new App()
     app.plugin(help)
     app.plugin(mock)
-    app.i18n.define('$zh', 'commands.help.messages.global-epilog', '')
+    app.i18n.define('$zh-CN', 'commands.help.messages.global-epilog', '')
     await app.start()
 
     const client = app.mock.client('123')
@@ -174,7 +158,8 @@ describe('@koishijs/plugin-help', () => {
     await app.start()
 
     const client = app.mock.client('123')
-    await client.shouldReply('test', '缺少参数，输入帮助以查看用法。')
+    await client.shouldReply('test', '请发送arg。')
+    await client.shouldReply('foo', 'pass')
     await client.shouldReply('test -h', '指令：test <arg>')
   })
 })
